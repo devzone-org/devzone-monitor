@@ -1,0 +1,49 @@
+{
+    "name": "devzone/log-monitor",
+    "description": "Ships a Laravel application's JSON log entries to a DevZone monitoring server on a schedule.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": ["laravel", "logging", "monitoring", "monolog", "devzone"],
+    "authors": [
+        {
+            "name": "DevZone"
+        }
+    ],
+    "require": {
+        "php": "^7.3 || ^8.0",
+        "ext-json": "*",
+        "guzzlehttp/guzzle": "^6.5.5 || ^7.0.1",
+        "laravel/framework": "^7.0 || ^8.0 || ^9.0 || ^10.0 || ^11.0",
+        "monolog/monolog": "^2.0 || ^3.0"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^9.5 || ^10.0 || ^11.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "DevZone\\LogMonitor\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "DevZone\\LogMonitor\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "DevZone\\LogMonitor\\LogMonitorServiceProvider"
+            ]
+        }
+    },
+    "scripts": {
+        "test": "phpunit"
+    },
+    "config": {
+        "sort-packages": true,
+        "policy": {
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
