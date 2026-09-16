@@ -153,7 +153,7 @@ advances only after a 2xx response.
         "url": "https://shop.example.com/register",
         "user_id": null
       },
-      "fingerprint": "6f1a4c0d5a2b9e8c7d3f2a1b0c9d8e7f"
+      "fingerprint": "250342a38defb5528f5bc25879216753"
     }
   ]
 }
