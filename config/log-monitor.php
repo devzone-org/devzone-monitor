@@ -23,9 +23,14 @@ return [
     | The API key is sent as "Authorization: Bearer <key>" and never appears in
     | the URL. Use one key per application so it can be rotated independently.
     |
+    | allow_http lets a local monitoring server run without TLS. It is only
+    | honoured when APP_ENV is local, development or testing; on any other
+    | environment it is ignored and http endpoints stay rejected.
+    |
     */
     'endpoint' => env('LOG_MONITOR_ENDPOINT'),
     'api_key' => env('LOG_MONITOR_API_KEY'),
+    'allow_http' => (bool) env('LOG_MONITOR_ALLOW_HTTP', false),
 
     /*
     |--------------------------------------------------------------------------

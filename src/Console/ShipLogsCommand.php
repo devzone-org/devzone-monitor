@@ -118,10 +118,9 @@ class ShipLogsCommand extends Command
             return 0;
         }
 
-        $endpoint = (string) ($this->config['endpoint'] ?? '');
-        if (!HttpTransport::isSecureEndpoint($endpoint)) {
-            error_log('[log-monitor] endpoint rejected: must be an absolute https URL');
-            $this->error('log-monitor: endpoint rejected, it must be an absolute https URL.');
+        if (!$this->transport->endpointAllowed()) {
+            error_log('[log-monitor] endpoint rejected: must be an absolute https URL (http is only allowed with LOG_MONITOR_ALLOW_HTTP=true in a local environment)');
+            $this->error('log-monitor: endpoint rejected, it must be an absolute https URL. Plain http needs LOG_MONITOR_ALLOW_HTTP=true and APP_ENV=local.');
 
             return 1;
         }

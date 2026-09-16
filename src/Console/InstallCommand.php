@@ -117,8 +117,14 @@ ENV;
         }
 
         $endpoint = config('log-monitor.endpoint');
-        if (is_string($endpoint) && $endpoint !== '' && !\DevZone\LogMonitor\Transport\HttpTransport::isSecureEndpoint($endpoint)) {
-            $warnings[] = 'LOG_MONITOR_ENDPOINT is not an https URL. The package refuses to ship to it.';
+        if (is_string($endpoint) && $endpoint !== '') {
+            $transport = $this->laravel->make(\DevZone\LogMonitor\Transport\HttpTransport::class);
+            if (!$transport->endpointAllowed()) {
+                $warnings[] = 'LOG_MONITOR_ENDPOINT is not an https URL. The package refuses to ship to it. '
+                    . 'For a local monitoring server set LOG_MONITOR_ALLOW_HTTP=true (honoured only when APP_ENV is local).';
+            } elseif (\DevZone\LogMonitor\Transport\HttpTransport::isSecureEndpoint($endpoint) === false) {
+                $warnings[] = 'LOG_MONITOR_ENDPOINT is plain http, accepted because this is a local environment. Production requires https.';
+            }
         }
 
         return $warnings;

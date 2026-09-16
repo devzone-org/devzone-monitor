@@ -7,7 +7,8 @@ use Illuminate\Support\Facades\Http;
 /**
  * POSTs a batch of entries to the monitoring server.
  *
- * - https only; plain http endpoints are rejected before any request is made
+ * - https only; plain http endpoints are rejected before any request is made,
+ *   unless allow_http is set and the application is not in production
  * - TLS verification is never disabled
  * - the API key travels in the Authorization header only
  * - 10 second timeout, no in-request retries
@@ -30,37 +31,74 @@ final class HttpTransport
     /** @var string|null */
     private $app;
 
-    public function __construct(string $endpoint, string $apiKey, int $timeout = self::DEFAULT_TIMEOUT, ?string $app = null)
-    {
+    /** @var bool Plain http accepted (local development only, decided by the caller). */
+    private $allowHttp;
+
+    public function __construct(
+        string $endpoint,
+        string $apiKey,
+        int $timeout = self::DEFAULT_TIMEOUT,
+        ?string $app = null,
+        bool $allowHttp = false
+    ) {
         $this->endpoint = trim($endpoint);
         $this->apiKey = trim($apiKey);
         $this->timeout = max(1, $timeout);
         $this->app = $app;
+        $this->allowHttp = $allowHttp;
     }
 
     /**
-     * @param array<string, mixed> $config The full log-monitor config array.
+     * Environments in which the allow_http flag is honoured at all.
      */
-    public static function fromConfig(array $config): self
+    const HTTP_ALLOWED_ENVIRONMENTS = ['local', 'development', 'dev', 'testing'];
+
+    /**
+     * @param array<string, mixed> $config The full log-monitor config array.
+     * @param string|null $environment The application environment (APP_ENV).
+     */
+    public static function fromConfig(array $config, ?string $environment = null): self
     {
         return new self(
             (string) ($config['endpoint'] ?? ''),
             (string) ($config['api_key'] ?? ''),
             (int) ($config['timeout'] ?? self::DEFAULT_TIMEOUT),
-            isset($config['app']) && is_string($config['app']) ? $config['app'] : null
+            isset($config['app']) && is_string($config['app']) ? $config['app'] : null,
+            self::httpAllowedFor(!empty($config['allow_http']), $environment)
         );
     }
 
     /**
-     * Only absolute https URLs with a host and no embedded credentials pass.
+     * http is only ever allowed when explicitly requested AND the environment
+     * is a development one. Production can never be downgraded by the flag.
      */
-    public static function isSecureEndpoint(string $url): bool
+    public static function httpAllowedFor(bool $flag, ?string $environment): bool
+    {
+        return $flag
+            && is_string($environment)
+            && in_array(strtolower($environment), self::HTTP_ALLOWED_ENVIRONMENTS, true);
+    }
+
+    /**
+     * Whether this transport will send to its configured endpoint.
+     */
+    public function endpointAllowed(): bool
+    {
+        return self::isSecureEndpoint($this->endpoint, $this->allowHttp);
+    }
+
+    /**
+     * Only absolute https URLs with a host and no embedded credentials pass.
+     * With $allowHttp, plain http is accepted as well.
+     */
+    public static function isSecureEndpoint(string $url, bool $allowHttp = false): bool
     {
         $parts = @parse_url(trim($url));
         if (!is_array($parts) || !isset($parts['scheme'], $parts['host'])) {
             return false;
         }
-        if (strtolower($parts['scheme']) !== 'https') {
+        $scheme = strtolower($parts['scheme']);
+        if ($scheme !== 'https' && !($allowHttp && $scheme === 'http')) {
             return false;
         }
         if (isset($parts['user']) || isset($parts['pass'])) {
@@ -88,7 +126,7 @@ final class HttpTransport
 
             return false;
         }
-        if (!self::isSecureEndpoint($this->endpoint)) {
+        if (!$this->endpointAllowed()) {
             error_log('[log-monitor] refusing to ship to a non-https endpoint');
 
             return false;
@@ -156,6 +194,7 @@ final class HttpTransport
             'api_key' => $this->apiKey === '' ? '' : '***',
             'timeout' => $this->timeout,
             'app' => $this->app,
+            'allow_http' => $this->allowHttp,
         ];
     }
 }

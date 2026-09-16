@@ -96,7 +96,9 @@ anything or touching the state file.
 | --- | --- | --- |
 | `enabled` | `true` | `false` disables reading, shipping and the schedule instantly. |
 | `endpoint` | env | Absolute **https** URL. Anything else is rejected. |
+| `allow_http` | `false` | `LOG_MONITOR_ALLOW_HTTP=true` accepts a plain `http://` endpoint for local development. Ignored when `APP_ENV=production`. |
 | `api_key` | env | Sent as `Authorization: Bearer`. One key per application. |
+| `allow_http` | `false` | Accept a plain http endpoint. Honoured only when `APP_ENV` is `local`, `development` or `testing`. |
 | `client`, `app` | env | Informational identity added to `extra`. |
 | `paths` | `storage/logs/laravel-*.log` | Glob patterns. Must resolve inside `storage/logs`. |
 | `max_file_age_hours` | `48` | Files older than this are ignored (no history flood on first install). |
@@ -239,7 +241,11 @@ anything third-party code puts into context.
 ### Transport
 
 - Endpoints must be absolute `https://` URLs; anything else is refused before
-  a single byte is sent.
+  a single byte is sent. The one exception is local development:
+  `LOG_MONITOR_ALLOW_HTTP=true` accepts `http://` when the app is not in
+  production. With `APP_ENV=production` the flag has no effect. For a monitoring server running on your machine set
+  `LOG_MONITOR_ALLOW_HTTP=true`; the flag is honoured only when `APP_ENV` is
+  `local`, `development` or `testing`, so it can never downgrade a live site.
 - TLS verification is never disabled and redirects are not followed, so the
   bearer token cannot be forwarded to another host.
 - The API key travels in the `Authorization` header only, never in the URL.

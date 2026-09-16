@@ -58,8 +58,12 @@ class LogMonitorServiceProvider extends ServiceProvider
 
         $this->app->bind(HttpTransport::class, function ($app) {
             $config = $app['config']->get('log-monitor', []);
+            $environment = method_exists($app, 'environment') ? $app->environment() : null;
 
-            return HttpTransport::fromConfig(is_array($config) ? $config : []);
+            return HttpTransport::fromConfig(
+                is_array($config) ? $config : [],
+                is_string($environment) ? $environment : null
+            );
         });
     }
 
