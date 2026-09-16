@@ -64,6 +64,8 @@ return [
     | min_level:       lowest level shipped; the file may contain more (LOG_LEVEL).
     | batch_size:      entries per HTTP request.
     | max_per_run:     hard ceiling of entries shipped per scheduler tick.
+    | max_bytes_per_run: hard ceiling of bytes read per tick, whatever the
+    |                  client's LOG_LEVEL is; 0 disables the limit.
     | max_chunk_bytes: bytes read from a file per pass.
     | timeout:         HTTP timeout in seconds; there are no in-request retries.
     |
@@ -71,6 +73,7 @@ return [
     'min_level' => env('LOG_MONITOR_MIN_LEVEL', 'warning'),
     'batch_size' => 100,
     'max_per_run' => 1000,
+    'max_bytes_per_run' => 16 * 1024 * 1024,
     'max_chunk_bytes' => 2 * 1024 * 1024,
     'message_max_length' => 4000,
     'timeout' => 10,

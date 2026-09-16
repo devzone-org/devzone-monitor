@@ -94,6 +94,23 @@ final class LogFileReaderTest extends TestCase
         $this->assertSame(1024, $chunk->end);
     }
 
+    public function testPerCallByteBudgetCapsTheChunk(): void
+    {
+        $line = '{"m":"' . str_repeat('x', 100) . '"}';
+        file_put_contents($this->path, str_repeat($line . "\n", 10));
+
+        $reader = new LogFileReader();
+        $chunk = $reader->read($this->path, 0, 2 * (strlen($line) + 1) + 5);
+
+        $this->assertCount(2, $chunk->lines);
+        $this->assertSame(2 * (strlen($line) + 1), $chunk->end);
+
+        // A budget smaller than one line yields nothing and does not advance.
+        $small = @$reader->read($this->path, $chunk->end, 20);
+        $this->assertTrue($small->isEmpty());
+        $this->assertSame($chunk->end, $small->end);
+    }
+
     public function testMissingFileIsHarmless(): void
     {
         $chunk = (new LogFileReader())->read($this->path . '.missing', 10);

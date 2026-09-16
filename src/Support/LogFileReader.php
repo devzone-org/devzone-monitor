@@ -22,9 +22,14 @@ final class LogFileReader
         $this->maxChunkBytes = max(1024, $maxChunkBytes);
     }
 
-    public function read(string $path, int $offset): LogChunk
+    /**
+     * @param int|null $maxBytes Optional per-call budget; the chunk is capped
+     *                           at min(maxBytes, configured chunk size).
+     */
+    public function read(string $path, int $offset, ?int $maxBytes = null): LogChunk
     {
         $offset = max(0, $offset);
+        $chunkCap = $maxBytes === null ? $this->maxChunkBytes : max(1, min($this->maxChunkBytes, $maxBytes));
 
         clearstatcache(true, $path);
         $size = @filesize($path);
@@ -43,7 +48,7 @@ final class LogFileReader
             return new LogChunk($offset, [], $offset, $size, $reset);
         }
 
-        $chunk = $this->readBytes($path, $offset, min($this->maxChunkBytes, $size - $offset));
+        $chunk = $this->readBytes($path, $offset, min($chunkCap, $size - $offset));
         if ($chunk === null || $chunk === '') {
             return new LogChunk($offset, [], $offset, $size, $reset);
         }
@@ -51,6 +56,8 @@ final class LogFileReader
         $lastNewline = strrpos($chunk, "\n");
         if ($lastNewline === false) {
             if (strlen($chunk) >= $this->maxChunkBytes) {
+                // Only the configured chunk size, never a smaller per-call
+                // budget, may declare a line oversized.
                 // A single line larger than the chunk cap can never be parsed.
                 // Skip past it; the remainder will be a malformed line and is
                 // dropped silently by the parser.

@@ -55,6 +55,12 @@ class ShipLogsCommand extends Command
     /** @var int */
     private $malformed = 0;
 
+    /** @var int Bytes consumed from log files during this run. */
+    private $bytesRead = 0;
+
+    /** @var int 0 means unlimited. */
+    private $maxBytes = 0;
+
     /** @var bool */
     private $failed = false;
 
@@ -78,6 +84,8 @@ class ShipLogsCommand extends Command
         $this->shipped = 0;
         $this->filtered = 0;
         $this->malformed = 0;
+        $this->bytesRead = 0;
+        $this->maxBytes = 0;
         $this->failed = false;
         $this->dryRun = false;
 
@@ -138,9 +146,10 @@ class ShipLogsCommand extends Command
         }
         $batchSize = max(1, (int) ($this->config['batch_size'] ?? 100));
         $maxPerRun = max(1, (int) ($this->config['max_per_run'] ?? 1000));
+        $this->maxBytes = max(0, (int) ($this->config['max_bytes_per_run'] ?? 0));
 
         foreach ($files as $path) {
-            if ($this->failed || $this->shipped >= $maxPerRun) {
+            if ($this->failed || $this->shipped >= $maxPerRun || $this->byteBudgetExhausted()) {
                 break;
             }
             $this->drainFile($path, $minSeverity, $batchSize, $maxPerRun);
@@ -151,8 +160,15 @@ class ShipLogsCommand extends Command
             $this->state->save();
         }
 
+        $note = '';
+        if ($this->failed) {
+            $note = ' (stopped early: shipping failed, entries will be retried next run)';
+        } elseif ($this->byteBudgetExhausted()) {
+            $note = ' (byte budget reached, the rest will be read next run)';
+        }
+
         $this->line(sprintf(
-            'log-monitor: %s %d entr%s, %d below %s, %d malformed line%s skipped%s.',
+            'log-monitor: %s %d entr%s, %d below %s, %d malformed line%s skipped, %s read%s.',
             $this->dryRun ? 'would ship' : 'shipped',
             $this->shipped,
             $this->shipped === 1 ? 'y' : 'ies',
@@ -160,7 +176,8 @@ class ShipLogsCommand extends Command
             (string) ($this->config['min_level'] ?? 'warning'),
             $this->malformed,
             $this->malformed === 1 ? '' : 's',
-            $this->failed ? ' (stopped early: shipping failed, entries will be retried next run)' : ''
+            $this->formatBytes($this->bytesRead),
+            $note
         ));
 
         return $this->failed ? 1 : 0;
@@ -175,8 +192,10 @@ class ShipLogsCommand extends Command
         $name = basename($path);
         $offset = $this->state->offset($name);
 
-        while (!$this->failed && $this->shipped < $maxPerRun) {
-            $chunk = $this->reader->read($path, $offset);
+        while (!$this->failed && $this->shipped < $maxPerRun && !$this->byteBudgetExhausted()) {
+            $budget = $this->maxBytes > 0 ? $this->maxBytes - $this->bytesRead : null;
+            $chunk = $this->reader->read($path, $offset, $budget);
+            $this->bytesRead += max(0, $chunk->end - $chunk->start);
 
             if ($chunk->reset) {
                 $this->line(sprintf('%s: file is smaller than the stored offset, restarting from 0.', $name));
@@ -299,6 +318,23 @@ class ShipLogsCommand extends Command
         $driver = config('queue.connections.' . $connection . '.driver');
 
         return is_string($driver) && !in_array($driver, ['sync', 'null'], true);
+    }
+
+    private function byteBudgetExhausted(): bool
+    {
+        return $this->maxBytes > 0 && $this->bytesRead >= $this->maxBytes;
+    }
+
+    private function formatBytes(int $bytes): string
+    {
+        if ($bytes >= 1048576) {
+            return sprintf('%.1f MB', $bytes / 1048576);
+        }
+        if ($bytes >= 1024) {
+            return sprintf('%.1f KB', $bytes / 1024);
+        }
+
+        return $bytes . ' B';
     }
 
     private function commit(string $name, int $offset, int $size): bool
