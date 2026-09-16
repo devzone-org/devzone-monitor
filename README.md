@@ -142,7 +142,19 @@ advances only after a 2xx response.
           "message": "SQLSTATE[23000]: ... (SQL: insert into users (email, password) values [REDACTED])",
           "code": "23000",
           "file": "/var/www/releases/20260916/vendor/laravel/framework/src/Illuminate/Database/Connection.php:822",
-          "trace": "#0 /var/www/releases/20260916/app/Http/Controllers/RegisterController.php(41): Illuminate\\Database\\Connection->runQueryCallback(...)\n#1 {main}"
+          "trace": [
+            "/var/www/releases/20260916/vendor/laravel/framework/src/Illuminate/Database/Connection.php:782",
+            "/var/www/releases/20260916/app/Http/Controllers/RegisterController.php:41"
+          ],
+          "previous": {
+            "class": "PDOException",
+            "message": "SQLSTATE[23000]: Integrity constraint violation: 1062 Duplicate entry",
+            "code": 23000,
+            "file": "/var/www/releases/20260916/vendor/laravel/framework/src/Illuminate/Database/Connection.php:492",
+            "trace": [
+              "/var/www/releases/20260916/vendor/laravel/framework/src/Illuminate/Database/Connection.php:492"
+            ]
+          }
         }
       },
       "extra": {
@@ -209,8 +221,10 @@ context, the extra block and exception traces, and consists of:
 - **SQL bindings.** `QueryException` messages embed the interpolated bindings
   in their `(SQL: ...)` tail. Everything after `VALUES`, `SET`, `WHERE` or
   `HAVING` is blanked while the statement shape is kept.
-- **Trace arguments.** `getTraceAsString()` includes scalar function
-  arguments. Every argument list in a trace becomes `(...)`.
+- **Trace arguments.** Monolog's JSON formatter writes exception traces as a
+  list of `file:line` strings with no arguments, so nothing extra is needed
+  there. If code logs `getTraceAsString()` output itself, which does include
+  scalar function arguments, every argument list becomes `(...)`.
 
 Review the defaults for your domain and extend `redact.keys` and
 `redact.patterns` as needed. Redaction runs on the raw line, so it also covers
