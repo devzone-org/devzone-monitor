@@ -102,9 +102,18 @@ ENV;
             $warnings[] = 'No active channel has the AddAppContext tap yet; the log file will not be JSON until it is added.';
         }
 
+        // A debug-level file is only a concern when it is not what the operator
+        // asked to ship; with min_level=debug it is deliberate.
         $level = $this->effectiveLevel($channels);
-        if ($level === 'debug' && $this->laravel->environment('production')) {
-            $warnings[] = 'LOG_LEVEL is "debug" in production. Every query and event will be written to disk; set LOG_LEVEL=warning.';
+        $minLevel = strtolower((string) config('log-monitor.min_level', 'warning'));
+        if ($level === 'debug' && $minLevel !== 'debug' && $this->laravel->environment('production')) {
+            $warnings[] = sprintf(
+                'LOG_LEVEL is "debug" in production but only "%s" and above is shipped. Every query and event '
+                . 'is written to disk and read back just to be discarded; set LOG_LEVEL=%s, or set '
+                . 'LOG_MONITOR_MIN_LEVEL=debug if you do want everything shipped.',
+                $minLevel,
+                $minLevel
+            );
         }
 
         $endpoint = config('log-monitor.endpoint');
