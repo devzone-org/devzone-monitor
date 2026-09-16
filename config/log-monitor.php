@@ -71,8 +71,8 @@ return [
     |
     */
     'min_level' => env('LOG_MONITOR_MIN_LEVEL', 'warning'),
-    'batch_size' => 100,
-    'max_per_run' => 1000,
+    'batch_size' => 500,
+    'max_per_run' => 10000,
     'max_bytes_per_run' => 16 * 1024 * 1024,
     'max_chunk_bytes' => 2 * 1024 * 1024,
     'message_max_length' => 4000,

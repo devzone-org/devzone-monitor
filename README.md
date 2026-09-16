@@ -18,8 +18,8 @@ dashboard are a separate project; this package is the client only.
    monitoring.
 2. The `log-monitor:ship` command runs every minute from the scheduler. It
    remembers a byte offset per file, reads only what is new, parses each line,
-   filters by `min_level`, redacts secrets, and POSTs batches of 100 to the
-   monitoring server. Each run ships at most 1000 entries and reads at most
+   filters by `min_level`, redacts secrets, and POSTs batches of 500 to the
+   monitoring server. Each run ships at most 10000 entries and reads at most
    16 MB, so a tick has a predictable maximum cost whatever the file size or
    the client's `LOG_LEVEL`; any remainder is picked up on the next tick.
 3. The offset is saved only after a batch has been shipped (or queued). A failed
@@ -101,8 +101,8 @@ anything or touching the state file.
 | `paths` | `storage/logs/laravel-*.log` | Glob patterns. Must resolve inside `storage/logs`. |
 | `max_file_age_hours` | `48` | Files older than this are ignored (no history flood on first install). |
 | `min_level` | `warning` | Lowest level shipped. |
-| `batch_size` | `100` | Entries per HTTP request. |
-| `max_per_run` | `1000` | Hard ceiling of shipped entries per scheduler tick. |
+| `batch_size` | `500` | Entries per HTTP request. |
+| `max_per_run` | `10000` | Hard ceiling of shipped entries per scheduler tick. |
 | `max_bytes_per_run` | 16 MB | Hard ceiling of bytes read per tick, independent of the client's `LOG_LEVEL`. `0` disables it. |
 | `max_chunk_bytes` | 2 MB | Bytes read per pass. |
 | `message_max_length` | `4000` | Message cap, applied after redaction. |
