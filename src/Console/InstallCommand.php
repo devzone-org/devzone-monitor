@@ -76,6 +76,10 @@ ENV;
     private function warnings(): array
     {
         $warnings = [];
+        if (!config('log-monitor.enabled', false)) {
+            $warnings[] = 'log-monitor is disabled. Nothing is read, shipped or scheduled until you set LOG_MONITOR_ENABLED=true.';
+        }
+
         $default = config('logging.default');
         $channels = $this->resolveChannels(is_string($default) ? $default : 'stack');
 

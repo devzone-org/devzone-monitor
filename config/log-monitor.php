@@ -7,12 +7,13 @@ return [
     | Master switch
     |--------------------------------------------------------------------------
     |
-    | false disables collection, shipping and the scheduled task instantly.
-    | The AddAppContext logging tap is a formatting concern of the host and is
-    | not affected by this switch.
+    | Off by default: installing or deploying the package does nothing until
+    | LOG_MONITOR_ENABLED=true is set. While off, nothing is read or shipped
+    | and the scheduled task is not registered. The AddAppContext logging tap
+    | is a formatting concern of the host and is not affected by this switch.
     |
     */
-    'enabled' => (bool) env('LOG_MONITOR_ENABLED', true),
+    'enabled' => (bool) env('LOG_MONITOR_ENABLED', false),
 
     /*
     |--------------------------------------------------------------------------

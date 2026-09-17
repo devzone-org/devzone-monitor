@@ -88,16 +88,24 @@ class LogMonitorServiceProvider extends ServiceProvider
     private function registerSchedule(): void
     {
         $config = $this->app['config'];
-        if (!$config->get('log-monitor.enabled', true) || !$config->get('log-monitor.schedule', true)) {
+        if (!$config->get('log-monitor.enabled', false) || !$config->get('log-monitor.schedule', true)) {
             return;
         }
 
-        $this->app->booted(function () {
-            /** @var Schedule $schedule */
-            $schedule = $this->app->make(Schedule::class);
+        // Hook the Schedule whenever it is resolved (schedule:run,
+        // schedule:list, ...) instead of resolving it on every boot. Works on
+        // Laravel 7-10, where the console kernel binds it after boot, and on
+        // 11+, where the foundation provider binds it.
+        $register = function (Schedule $schedule) {
             $schedule->command('log-monitor:ship')
                 ->everyMinute()
                 ->withoutOverlapping(10);
-        });
+        };
+
+        $this->app->afterResolving(Schedule::class, $register);
+
+        if ($this->app->resolved(Schedule::class)) {
+            $register($this->app->make(Schedule::class));
+        }
     }
 }

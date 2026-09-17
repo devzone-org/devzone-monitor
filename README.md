@@ -52,6 +52,9 @@ In `config/logging.php`:
 
 ### 2. Environment
 
+The package is **disabled by default**. Installing or deploying it changes
+nothing until you set `LOG_MONITOR_ENABLED=true`.
+
 ```env
 LOG_CHANNEL=daily
 LOG_STACK=daily
@@ -94,9 +97,8 @@ anything or touching the state file.
 
 | Key | Default | Purpose |
 | --- | --- | --- |
-| `enabled` | `true` | `false` disables reading, shipping and the schedule instantly. |
+| `enabled` | `false` | Off by default. Set `LOG_MONITOR_ENABLED=true` to turn on reading, shipping and the schedule. |
 | `endpoint` | env | Absolute **https** URL. Anything else is rejected. |
-| `allow_http` | `false` | `LOG_MONITOR_ALLOW_HTTP=true` accepts a plain `http://` endpoint for local development. Ignored when `APP_ENV=production`. |
 | `api_key` | env | Sent as `Authorization: Bearer`. One key per application. |
 | `allow_http` | `false` | Accept a plain http endpoint. Honoured only when `APP_ENV` is `local`, `development` or `testing`. |
 | `client`, `app` | env | Informational identity added to `extra`. |
@@ -241,9 +243,7 @@ anything third-party code puts into context.
 ### Transport
 
 - Endpoints must be absolute `https://` URLs; anything else is refused before
-  a single byte is sent. The one exception is local development:
-  `LOG_MONITOR_ALLOW_HTTP=true` accepts `http://` when the app is not in
-  production. With `APP_ENV=production` the flag has no effect. For a monitoring server running on your machine set
+  a single byte is sent. For a monitoring server running on your machine set
   `LOG_MONITOR_ALLOW_HTTP=true`; the flag is honoured only when `APP_ENV` is
   `local`, `development` or `testing`, so it can never downgrade a live site.
 - TLS verification is never disabled and redirects are not followed, so the
@@ -264,8 +264,9 @@ attributed to another client.
 
 - Readable paths are restricted to `storage/logs`. Patterns containing `..`,
   resolving outside the directory, or symlinks pointing elsewhere are rejected.
-- `LOG_MONITOR_ENABLED=false` disables collection, shipping and scheduling
-  instantly. The logging tap keeps producing JSON; that is a formatting choice
+- The package is off by default. Only `LOG_MONITOR_ENABLED=true` turns on
+  collection, shipping and scheduling, and removing it or setting `false`
+  switches them off again instantly. The logging tap keeps producing JSON; that is a formatting choice
   of the host application.
 - The package never reports its own problems through `Log::`. Doing so would
   write to the very file being read and loop forever. Problems go to

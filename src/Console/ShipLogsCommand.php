@@ -107,7 +107,7 @@ class ShipLogsCommand extends Command
         $this->dryRun = (bool) $this->option('dry-run');
 
         if (empty($this->config['enabled'])) {
-            $this->line('log-monitor is disabled (LOG_MONITOR_ENABLED=false).');
+            $this->line('log-monitor is disabled. Set LOG_MONITOR_ENABLED=true to enable it.');
 
             return 0;
         }

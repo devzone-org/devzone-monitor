@@ -33,11 +33,14 @@ class HttpTransportTest extends TestCase
         $this->assertFalse(HttpTransport::isSecureEndpoint('https://user:pass@monitor.test/api/ingest'));
     }
 
-    public function testAllowsHttpFollowsTheConfigFlagOutsideLaravel(): void
+    public function testHttpIsHonouredOnlyInDevelopmentEnvironments(): void
     {
-        $this->assertFalse(HttpTransport::allowsHttp([]));
-        $this->assertFalse(HttpTransport::allowsHttp(['allow_http' => false]));
-        $this->assertTrue(HttpTransport::allowsHttp(['allow_http' => true]));
+        $this->assertFalse(HttpTransport::httpAllowedFor(false, 'local'));
+        $this->assertTrue(HttpTransport::httpAllowedFor(true, 'local'));
+        $this->assertTrue(HttpTransport::httpAllowedFor(true, 'testing'));
+        $this->assertFalse(HttpTransport::httpAllowedFor(true, 'production'));
+        $this->assertFalse(HttpTransport::httpAllowedFor(true, 'staging'));
+        $this->assertFalse(HttpTransport::httpAllowedFor(true, null));
     }
 
     public function testFromConfigCarriesTheFlagIntoSend(): void
@@ -45,8 +48,8 @@ class HttpTransportTest extends TestCase
         $transport = HttpTransport::fromConfig([
             'endpoint' => 'http://monitor.test/api/ingest',
             'api_key' => 'dzm_abc.def',
-            'allow_http' => false,
-        ]);
+            'allow_http' => true,
+        ], 'production');
 
         // Refused before any request is attempted, so no HTTP client is needed.
         $this->assertFalse(@$transport->send([['message' => 'x']]));
