@@ -2,6 +2,7 @@
 
 namespace DevZone\LogMonitor\Logging;
 
+use DevZone\LogMonitor\Support\CurrentUser;
 use Illuminate\Container\Container;
 
 /**
@@ -112,7 +113,6 @@ final class AppContext
 
     /**
      * Only reports a user that has already been resolved for this request.
-     * hasUser() never touches the session or the database.
      *
      * @return int|string|null
      */
@@ -123,13 +123,8 @@ final class AppContext
             if ($app === null || !$app->bound('auth')) {
                 return null;
             }
-            $auth = $app->make('auth');
-            if (!is_object($auth) || !method_exists($auth, 'hasUser') || !$auth->hasUser()) {
-                return null;
-            }
-            $id = $auth->id();
 
-            return is_int($id) || is_string($id) ? $id : null;
+            return CurrentUser::id($app->make('auth'));
         } catch (\Throwable $e) {
             return null;
         }

@@ -5,6 +5,7 @@ namespace DevZone\LogMonitor\Http\Middleware;
 use Closure;
 use DevZone\LogMonitor\Capture\Execution;
 use DevZone\LogMonitor\Capture\Recorder;
+use DevZone\LogMonitor\Support\CurrentUser;
 use DevZone\LogMonitor\Support\Redactor;
 use DevZone\LogMonitor\Support\Report;
 use DevZone\LogMonitor\Support\Text;
@@ -245,13 +246,7 @@ class CaptureRequests
     private function userId()
     {
         try {
-            $auth = app('auth');
-            if (!method_exists($auth, 'hasUser') || !$auth->hasUser()) {
-                return null;
-            }
-            $id = $auth->id();
-
-            return is_int($id) || is_string($id) ? $id : null;
+            return CurrentUser::id(app('auth'));
         } catch (\Throwable $e) {
             return null;
         }
