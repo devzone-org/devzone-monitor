@@ -5,8 +5,6 @@ namespace DevZone\LogMonitor\Tests;
 use DevZone\LogMonitor\Logging\AddAppContext;
 use DevZone\LogMonitor\Logging\AppContext;
 use DevZone\LogMonitor\Logging\Monolog2Processor;
-use DevZone\LogMonitor\Support\EntryBuilder;
-use DevZone\LogMonitor\Support\Redactor;
 use Monolog\Handler\StreamHandler;
 use Monolog\Logger;
 use PHPUnit\Framework\TestCase;
@@ -46,7 +44,7 @@ final class ProcessorTest extends TestCase
         $this->assertInstanceOf($expected, AddAppContext::makeProcessor());
     }
 
-    public function testTapProducesJsonLinesTheBuilderCanParse(): void
+    public function testV1TapStillProducesJsonLines(): void
     {
         $stream = fopen('php://memory', 'w+');
         $logger = new Logger('test');
@@ -70,12 +68,7 @@ final class ProcessorTest extends TestCase
         }
         $this->assertArrayHasKey('trace', $decoded['context']['exception'], 'stack traces must be included');
 
-        $entry = (new EntryBuilder(new Redactor()))->fromLine($line);
-
-        $this->assertSame('error', $entry['level']);
-        $this->assertSame(400, $entry['severity']);
-        $this->assertSame('[REDACTED]', $entry['context']['password']);
-        $this->assertStringNotContainsString('example.com', $entry['context']['exception']['message']);
-        $this->assertStringNotContainsString('example.com', json_encode($entry));
+        $this->assertSame(400, $decoded['level']);
+        $this->assertSame('ERROR', $decoded['level_name']);
     }
 }

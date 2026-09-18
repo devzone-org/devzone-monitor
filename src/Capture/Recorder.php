@@ -1,0 +1,1156 @@
+<?php
+
+namespace DevZone\LogMonitor\Capture;
+
+use DevZone\LogMonitor\Support\Fingerprint;
+use DevZone\LogMonitor\Support\Levels;
+use DevZone\LogMonitor\Support\Redactor;
+use DevZone\LogMonitor\Support\Report;
+use DevZone\LogMonitor\Support\Text;
+
+/**
+ * The capture core. Laravel adapters (middleware, event listeners) call the
+ * record* methods; nothing here touches the disk or the network until an
+ * execution finishes, and then only through the RecordSink, in one write.
+ *
+ * Every public method is safe to call from inside the host application's
+ * request: failures are reported through error_log() and swallowed.
+ */
+class Recorder
+{
+    const RECORD_VERSION = 1;
+    const MESSAGE_MAX = 4000;
+    const MAX_EXCEPTIONS = 50;
+    const MAX_PREVIOUS = 3;
+    const CONTEXT_MAX_DEPTH = 6;
+    const CONTEXT_MAX_ITEMS = 100;
+
+    /** @var array<string, mixed> */
+    private $config;
+
+    /** @var RecordSink */
+    private $sink;
+
+    /** @var Redactor */
+    private $redactor;
+
+    /** @var Location */
+    private $location;
+
+    /** @var callable(): float */
+    private $clock;
+
+    /** @var callable(): float Uniform in [0, 1). */
+    private $random;
+
+    /** @var array<int, Execution> Innermost last. */
+    private $stack = [];
+
+    /** @var bool */
+    private $shutdownRegistered = false;
+
+    /** @var array<string, array{0: string, 1: string}> statement key => [hash, normalized sql] */
+    private $normalized = [];
+
+    public function __construct(
+        array $config,
+        RecordSink $sink,
+        Redactor $redactor,
+        Location $location,
+        ?callable $clock = null,
+        ?callable $random = null
+    ) {
+        $this->config = $config;
+        $this->sink = $sink;
+        $this->redactor = $redactor;
+        $this->location = $location;
+        $this->clock = $clock ?: function () {
+            return microtime(true);
+        };
+        $this->random = $random ?: function () {
+            return mt_rand() / (mt_getrandmax() + 1);
+        };
+    }
+
+    // ------------------------------------------------------------------
+    // Executions
+    // ------------------------------------------------------------------
+
+    public function startRequest(): ?Execution
+    {
+        try {
+            // A request starts a fresh stack: anything left from a previous
+            // request in a long-running process is abandoned.
+            $this->stack = [];
+            $execution = $this->newExecution('request', null, $this->config);
+            $this->stack[] = $execution;
+
+            return $execution;
+        } catch (\Throwable $e) {
+            Report::error('could not start request capture', $e);
+
+            return null;
+        }
+    }
+
+    public function currentRequest(): ?Execution
+    {
+        foreach ($this->stack as $execution) {
+            if ($execution->kind === 'request') {
+                return $execution;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param array<string, mixed> $info method, url, route, route_name, action, status, ip,
+     *                                   user, request_bytes, response_bytes, bootstrap_ms,
+     *                                   request_body, response_body, request_headers
+     */
+    public function finishRequest(Execution $execution, array $info): void
+    {
+        if ($execution->finished) {
+            return;
+        }
+        try {
+            $execution->finished = true;
+            $this->remove($execution);
+
+            $status = isset($info['status']) ? (int) $info['status'] : null;
+            if ($status === null || $status >= 500) {
+                $execution->errored = true;
+            }
+
+            $lines = [];
+            if ($this->setting('requests.enabled', true)) {
+                $record = [
+                    't' => 'request',
+                    'v' => self::RECORD_VERSION,
+                    'trace' => $execution->trace,
+                    'at' => $this->iso($execution->startedAt),
+                    'ms' => $this->elapsedMs($execution),
+                    'bootstrap_ms' => $info['bootstrap_ms'] ?? null,
+                    'method' => $info['method'] ?? null,
+                    'url' => isset($info['url']) ? $this->stripQuery((string) $info['url']) : null,
+                    'route' => $info['route'] ?? null,
+                    'route_name' => $info['route_name'] ?? null,
+                    'action' => $info['action'] ?? null,
+                    'group' => isset($info['method'], $info['route']) ? Fingerprint::route((string) $info['method'], (string) $info['route']) : null,
+                    'status' => $status,
+                    'ip' => $info['ip'] ?? null,
+                    'user' => $info['user'] ?? null,
+                    'request_bytes' => $info['request_bytes'] ?? null,
+                    'response_bytes' => $info['response_bytes'] ?? null,
+                    'memory_peak_mb' => round(memory_get_peak_usage(true) / 1048576, 1),
+                ] + $this->totals($execution);
+
+                if (!empty($info['interrupted'])) {
+                    $record['interrupted'] = true;
+                }
+                foreach (['request_headers', 'request_body', 'response_body'] as $key) {
+                    if (isset($info[$key])) {
+                        $record[$key] = $info[$key];
+                    }
+                }
+                $lines[] = $this->encode($record);
+            }
+
+            $lines = array_merge($lines, $this->detailLines($execution, true));
+            $this->write($lines);
+        } catch (\Throwable $e) {
+            Report::error('could not finish request capture', $e);
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $meta class, queue, connection, job_id, attempt
+     */
+    public function startJob(array $meta, ?string $parent): ?Execution
+    {
+        try {
+            if (!$this->setting('jobs.enabled', true)) {
+                return null;
+            }
+            $class = isset($meta['class']) ? (string) $meta['class'] : '';
+            $overrides = $this->setting('jobs.overrides.' . $class, []);
+            $config = is_array($overrides) && $overrides !== [] ? self::applyOverrides($this->config, $overrides) : $this->config;
+
+            if ($parent === null && ($current = $this->current()) !== null) {
+                $parent = $current->trace; // sync queue: the job runs inside its parent
+            }
+
+            $execution = $this->newExecution('job', $parent, $config);
+            $execution->meta = $meta;
+            $this->stack[] = $execution;
+
+            return $execution;
+        } catch (\Throwable $e) {
+            Report::error('could not start job capture', $e);
+
+            return null;
+        }
+    }
+
+    public function findJob(string $jobId): ?Execution
+    {
+        for ($i = count($this->stack) - 1; $i >= 0; $i--) {
+            $execution = $this->stack[$i];
+            if ($execution->kind === 'job' && (string) ($execution->meta['job_id'] ?? '') === $jobId) {
+                return $execution;
+            }
+        }
+
+        return null;
+    }
+
+    public function finishJob(Execution $execution, string $status, ?\Throwable $exception = null): void
+    {
+        if ($execution->finished) {
+            return;
+        }
+        try {
+            if ($exception !== null) {
+                $this->recordExceptionOn($execution, $exception);
+            }
+            $execution->finished = true;
+            $this->remove($execution);
+            if (in_array($status, ['failed', 'exception', 'interrupted'], true)) {
+                $execution->errored = true;
+            }
+
+            $record = [
+                't' => 'job',
+                'v' => self::RECORD_VERSION,
+                'trace' => $execution->trace,
+                'parent' => $execution->parent,
+                'at' => $this->iso($execution->startedAt),
+                'ms' => $this->elapsedMs($execution),
+                'class' => $execution->meta['class'] ?? null,
+                'queue' => $execution->meta['queue'] ?? null,
+                'connection' => $execution->meta['connection'] ?? null,
+                'job_id' => $execution->meta['job_id'] ?? null,
+                'attempt' => $execution->meta['attempt'] ?? null,
+                'status' => $status,
+                'memory_peak_mb' => round(memory_get_peak_usage(true) / 1048576, 1),
+                'partial_flushes' => $execution->flushes,
+            ] + $this->totals($execution);
+
+            if ($exception !== null) {
+                $record['exception'] = [
+                    'class' => get_class($exception),
+                    'message' => $this->redactor->redactString(Text::limit((string) $exception->getMessage(), 1000)),
+                ];
+            }
+
+            $lines = array_merge([$this->encode($record)], $this->detailLines($execution, true));
+            $this->write($lines);
+        } catch (\Throwable $e) {
+            Report::error('could not finish job capture', $e);
+        }
+    }
+
+    /**
+     * A job that failed without running here (timed out in another attempt,
+     * exceeded its tries before starting): one standalone job line.
+     *
+     * @param array<string, mixed> $meta
+     */
+    public function recordJobFailure(array $meta, ?string $parent, ?\Throwable $exception): void
+    {
+        try {
+            if (!$this->setting('jobs.enabled', true)) {
+                return;
+            }
+            $record = [
+                't' => 'job',
+                'v' => self::RECORD_VERSION,
+                'trace' => self::newTrace(),
+                'parent' => $parent,
+                'at' => $this->iso($this->now()),
+                'ms' => null,
+                'class' => $meta['class'] ?? null,
+                'queue' => $meta['queue'] ?? null,
+                'connection' => $meta['connection'] ?? null,
+                'job_id' => $meta['job_id'] ?? null,
+                'attempt' => $meta['attempt'] ?? null,
+                'status' => 'failed',
+            ];
+            if ($exception !== null) {
+                $record['exception'] = [
+                    'class' => get_class($exception),
+                    'message' => $this->redactor->redactString(Text::limit((string) $exception->getMessage(), 1000)),
+                ];
+            }
+            $this->write([$this->encode($record)]);
+        } catch (\Throwable $e) {
+            Report::error('could not record job failure', $e);
+        }
+    }
+
+    public function current(): ?Execution
+    {
+        $count = count($this->stack);
+
+        return $count > 0 ? $this->stack[$count - 1] : null;
+    }
+
+    public function currentTrace(): ?string
+    {
+        $current = $this->current();
+
+        return $current === null ? null : $current->trace;
+    }
+
+    /**
+     * Registered with register_shutdown_function: writes whatever is still
+     * open when PHP stops (fatal error, exit() inside a request, a worker
+     * exiting mid-job), so those executions are not silently lost.
+     */
+    public function shutdown(): void
+    {
+        try {
+            $fatal = self::fatalError();
+            for ($i = count($this->stack) - 1; $i >= 0; $i--) {
+                $execution = $this->stack[$i];
+                if ($fatal !== null && $i === count($this->stack) - 1) {
+                    $execution->exceptions[] = $this->fatalRecord($execution, $fatal);
+                    $execution->exceptionCount++;
+                }
+                if ($execution->kind === 'request') {
+                    $this->finishRequest($execution, ['status' => null, 'interrupted' => true]);
+                } else {
+                    $this->finishJob($execution, 'interrupted');
+                }
+            }
+        } catch (\Throwable $e) {
+            Report::error('could not flush at shutdown', $e);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Capture
+    // ------------------------------------------------------------------
+
+    public function recordQuery(string $sql, float $ms, string $connection): void
+    {
+        try {
+            $execution = $this->current();
+            if ($execution === null || !$execution->setting('queries.enabled', true)) {
+                return;
+            }
+
+            $execution->queryCount++;
+            $execution->queryMs += $ms;
+
+            $key = $connection . "\0" . $sql;
+            if (!isset($execution->statements[$key])) {
+                $execution->statements[$key] = [$connection, $sql, 0, 0.0, null];
+            }
+            $execution->statements[$key][2]++;
+            $execution->statements[$key][3] += $ms;
+            $count = $execution->statements[$key][2];
+
+            $slowMs = (float) $execution->setting('queries.slow_ms', 100);
+            $isSlow = $slowMs > 0 && $ms >= $slowMs;
+            $threshold = (int) $execution->setting('queries.repeated_threshold', 10);
+            $becameRepeated = $threshold > 0 && $count === $threshold;
+            $locateAll = $execution->setting('queries.capture_location', 'slow') === 'all';
+            $mode = (string) $execution->setting('queries.mode', 'sampled');
+
+            $location = null;
+            if ($locateAll || $isSlow || $becameRepeated) {
+                $location = $this->location->find();
+            }
+            if ($becameRepeated) {
+                $execution->statements[$key][4] = $location;
+            }
+
+            if ($isSlow) {
+                if (count($execution->slowQueries) < (int) $execution->setting('queries.max_slow_per_request', 100)) {
+                    $execution->slowQueries[] = ['key' => $key, 'ms' => $ms, 'at' => $this->now(), 'location' => $location];
+                    $execution->pending++;
+                } else {
+                    $execution->dropped['slow_queries']++;
+                }
+            }
+
+            if ($mode !== 'summary') {
+                $kept = count($execution->queries) + (int) ($execution->meta['_queries_flushed'] ?? 0);
+                if ($kept < (int) $execution->setting('queries.max_per_request', 2000)) {
+                    $execution->queries[] = [$key, $ms, $locateAll ? $location : null];
+                    if ($execution->keepQueries) {
+                        $execution->pending++;
+                    }
+                } else {
+                    $execution->dropped['queries']++;
+                }
+            }
+
+            $this->maybeFlush($execution);
+        } catch (\Throwable $e) {
+            Report::error('could not record query', $e);
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $call method, url, status (int|null), ms (float|null),
+     *                                   request_bytes, response_bytes, error,
+     *                                   request_body, response_body
+     */
+    public function recordOutgoing(array $call): void
+    {
+        try {
+            $execution = $this->current();
+            if ($execution === null || !$execution->setting('outgoing.enabled', true)) {
+                return;
+            }
+
+            $ms = isset($call['ms']) ? (float) $call['ms'] : null;
+            $execution->outgoingCount++;
+            $execution->outgoingMs += (float) $ms;
+
+            if (count($execution->outgoing) + (int) ($execution->meta['_outgoing_flushed'] ?? 0) >= (int) $execution->setting('outgoing.max_per_request', 500)) {
+                $execution->dropped['outgoing']++;
+
+                return;
+            }
+
+            $status = isset($call['status']) ? (int) $call['status'] : null;
+            $failed = $status === null || $status >= 400 || !empty($call['error']);
+            $parts = parse_url((string) ($call['url'] ?? '')) ?: [];
+
+            $record = [
+                't' => 'outgoing',
+                'v' => self::RECORD_VERSION,
+                'trace' => $execution->trace,
+                'at' => $this->iso($this->now() - ($ms !== null ? $ms / 1000 : 0)),
+                'method' => isset($call['method']) ? strtoupper((string) $call['method']) : null,
+                'scheme' => $parts['scheme'] ?? null,
+                'host' => $parts['host'] ?? null,
+                'port' => $parts['port'] ?? null,
+                'path' => $parts['path'] ?? '/',
+                'status' => $status,
+                'ms' => $ms !== null ? round($ms, 2) : null,
+                'request_bytes' => $call['request_bytes'] ?? null,
+                'response_bytes' => $call['response_bytes'] ?? null,
+            ];
+            if (!empty($call['error'])) {
+                $record['error'] = $this->redactor->redactString(Text::limit((string) $call['error'], 1000));
+            }
+            if ($failed && $execution->setting('outgoing.bodies_on_error', true)) {
+                $max = (int) $execution->setting('outgoing.max_bytes', 8192);
+                foreach (['request_body', 'response_body'] as $key) {
+                    if (isset($call[$key]) && is_string($call[$key]) && $call[$key] !== '') {
+                        $record[$key] = $this->body($call[$key], $max);
+                    }
+                }
+            }
+            if ($failed) {
+                $execution->errored = true;
+            }
+
+            $execution->outgoing[] = $record;
+            $execution->pending++;
+            $this->maybeFlush($execution);
+        } catch (\Throwable $e) {
+            Report::error('could not record outgoing call', $e);
+        }
+    }
+
+    /**
+     * @param mixed $message
+     */
+    public function recordLog(string $level, $message, array $context): void
+    {
+        try {
+            if (!$this->setting('logs.enabled', true)) {
+                return;
+            }
+            $execution = $this->current();
+            $minimum = (string) ($execution !== null ? $execution->setting('logs.level', 'warning') : $this->setting('logs.level', 'warning'));
+
+            // Exceptions reported through the log are captured as exception
+            // records whatever the log level.
+            $exception = isset($context['exception']) && $context['exception'] instanceof \Throwable ? $context['exception'] : null;
+            if ($exception !== null && $this->setting('exceptions.enabled', true)) {
+                if ($execution !== null) {
+                    $this->recordExceptionOn($execution, $exception);
+                } else {
+                    $this->write([$this->encode($this->exceptionRecord(null, $exception))]);
+                }
+            }
+
+            if (!Levels::passes($level, $minimum)) {
+                return;
+            }
+
+            $text = $this->redactor->redactString($this->stringify($message));
+            $normalizedContext = $this->normalizeContext($context);
+            $record = [
+                't' => 'log',
+                'v' => self::RECORD_VERSION,
+                'trace' => $execution !== null ? $execution->trace : null,
+                'at' => $this->iso($this->now()),
+                'level' => strtolower($level),
+                'severity' => Levels::severity($level),
+                'message' => Text::limit($text, self::MESSAGE_MAX),
+                'context' => $this->redactor->redact($normalizedContext),
+                'fingerprint' => Fingerprint::log($level, $text),
+            ];
+
+            if ($execution === null) {
+                $this->write([$this->encode($record)]);
+
+                return;
+            }
+
+            $execution->logCount++;
+            if (Levels::severity($level) !== null && Levels::severity($level) >= 400) {
+                $execution->errored = true;
+            }
+            if (count($execution->logs) + (int) ($execution->meta['_logs_flushed'] ?? 0) >= (int) $execution->setting('logs.max_per_request', 200)) {
+                $execution->dropped['logs']++;
+
+                return;
+            }
+            $execution->logs[] = $record;
+            $execution->pending++;
+            $this->maybeFlush($execution);
+        } catch (\Throwable $e) {
+            Report::error('could not record log', $e);
+        }
+    }
+
+    public function recordException(\Throwable $exception): void
+    {
+        try {
+            if (!$this->setting('exceptions.enabled', true)) {
+                return;
+            }
+            $execution = $this->current();
+            if ($execution === null) {
+                $this->write([$this->encode($this->exceptionRecord(null, $exception))]);
+
+                return;
+            }
+            $this->recordExceptionOn($execution, $exception);
+        } catch (\Throwable $e) {
+            Report::error('could not record exception', $e);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Building records
+    // ------------------------------------------------------------------
+
+    private function recordExceptionOn(Execution $execution, \Throwable $exception): void
+    {
+        if (!$this->setting('exceptions.enabled', true)) {
+            return;
+        }
+        $id = spl_object_id($exception);
+        if (isset($execution->seenExceptions[$id])) {
+            return;
+        }
+        $execution->seenExceptions[$id] = true;
+        $execution->exceptionCount++;
+        $execution->errored = true;
+        if (count($execution->exceptions) >= self::MAX_EXCEPTIONS) {
+            $execution->dropped['exceptions']++;
+
+            return;
+        }
+        $execution->exceptions[] = $this->exceptionRecord($execution, $exception);
+        $execution->pending++;
+        $this->maybeFlush($execution);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function exceptionRecord(?Execution $execution, \Throwable $exception): array
+    {
+        $file = $this->location->relative((string) $exception->getFile());
+        $line = (int) $exception->getLine();
+        $maxFrames = (int) $this->setting('exceptions.max_frames', 50);
+
+        $frames = [];
+        foreach ($exception->getTrace() as $frame) {
+            if (count($frames) >= $maxFrames) {
+                break;
+            }
+            if (isset($frame['file'], $frame['line'])) {
+                $frames[] = $this->location->relative((string) $frame['file']) . ':' . (int) $frame['line'];
+            }
+        }
+
+        $previous = [];
+        $cause = $exception->getPrevious();
+        while ($cause !== null && count($previous) < self::MAX_PREVIOUS) {
+            $previous[] = [
+                'class' => get_class($cause),
+                'message' => Text::limit($this->redactor->redactString((string) $cause->getMessage()), 1000),
+                'file' => $this->location->relative((string) $cause->getFile()),
+                'line' => (int) $cause->getLine(),
+            ];
+            $cause = $cause->getPrevious();
+        }
+
+        return [
+            't' => 'exception',
+            'v' => self::RECORD_VERSION,
+            'trace' => $execution !== null ? $execution->trace : null,
+            'at' => $this->iso($this->now()),
+            'class' => get_class($exception),
+            'message' => Text::limit($this->redactor->redactString((string) $exception->getMessage()), self::MESSAGE_MAX),
+            'code' => (string) $exception->getCode(),
+            'file' => $file,
+            'line' => $line,
+            'frames' => $frames,
+            'previous' => $previous,
+            'fingerprint' => Fingerprint::exception(get_class($exception), $file, $line),
+        ];
+    }
+
+    /**
+     * @param array{type: int, message: string, file: string, line: int} $error
+     * @return array<string, mixed>
+     */
+    private function fatalRecord(Execution $execution, array $error): array
+    {
+        $file = $this->location->relative((string) $error['file']);
+
+        return [
+            't' => 'exception',
+            'v' => self::RECORD_VERSION,
+            'trace' => $execution->trace,
+            'at' => $this->iso($this->now()),
+            'class' => 'FatalError',
+            'message' => Text::limit($this->redactor->redactString((string) $error['message']), self::MESSAGE_MAX),
+            'code' => (string) $error['type'],
+            'file' => $file,
+            'line' => (int) $error['line'],
+            'frames' => [],
+            'previous' => [],
+            'fingerprint' => Fingerprint::exception('FatalError', $file, (int) $error['line']),
+        ];
+    }
+
+    /**
+     * Lines for everything buffered on the execution. On the final call the
+     * repeated-query records are added and the buffers are dropped with the
+     * execution; on a partial flush the buffers are cleared and kept going.
+     *
+     * @return array<int, string>
+     */
+    private function detailLines(Execution $execution, bool $final): array
+    {
+        $lines = [];
+        $includeQueries = $execution->keepQueries || ($final && $execution->errored);
+
+        if ($includeQueries && $execution->queries !== []) {
+            foreach ($this->queryLines($execution, $final) as $line) {
+                $lines[] = $line;
+            }
+        }
+
+        foreach ($execution->slowQueries as $slow) {
+            list($hash, $sql, $connection) = $this->statement($execution, $slow['key']);
+            $record = [
+                't' => 'slow-query',
+                'v' => self::RECORD_VERSION,
+                'trace' => $execution->trace,
+                'at' => $this->iso($slow['at'] - $slow['ms'] / 1000),
+                'hash' => $hash,
+                'connection' => $connection,
+                'sql' => $sql,
+                'ms' => round($slow['ms'], 2),
+            ];
+            if ($slow['location'] !== null) {
+                $record['file'] = $slow['location'][0];
+                $record['line'] = $slow['location'][1];
+            }
+            $lines[] = $this->encode($record);
+        }
+
+        if ($final) {
+            $threshold = (int) $execution->setting('queries.repeated_threshold', 10);
+            if ($threshold > 0) {
+                foreach ($execution->statements as $key => $statement) {
+                    if ($statement[2] < $threshold) {
+                        continue;
+                    }
+                    list($hash, $sql, $connection) = $this->statement($execution, $key);
+                    $record = [
+                        't' => 'repeated-query',
+                        'v' => self::RECORD_VERSION,
+                        'trace' => $execution->trace,
+                        'hash' => $hash,
+                        'connection' => $connection,
+                        'sql' => $sql,
+                        'count' => $statement[2],
+                        'total_ms' => round($statement[3], 2),
+                    ];
+                    if ($statement[4] !== null) {
+                        $record['file'] = $statement[4][0];
+                        $record['line'] = $statement[4][1];
+                    }
+                    $lines[] = $this->encode($record);
+                }
+            }
+        }
+
+        foreach (['outgoing', 'logs', 'exceptions'] as $bucket) {
+            foreach ($execution->{$bucket} as $record) {
+                $lines[] = $this->encode($record);
+            }
+        }
+
+        return $lines;
+    }
+
+    /**
+     * The compact per-execution query list: each distinct statement once in
+     * "sql", every execution as [hash, ms] (plus "file:line" when locations
+     * are captured for all queries). Split into several lines when needed so
+     * no line exceeds max_record_bytes.
+     *
+     * @return array<int, string>
+     */
+    private function queryLines(Execution $execution, bool $final): array
+    {
+        $limit = (int) $this->setting('spool.max_record_bytes', 32768);
+        $budget = max(1024, (int) ($limit * 0.85));
+
+        $chunks = [];
+        $sql = [];
+        $entries = [];
+        $size = 200;
+
+        foreach ($execution->queries as $query) {
+            list($hash, $normalized, $connection) = $this->statement($execution, $query[0]);
+            $entry = [$hash, round($query[1], 2)];
+            if ($query[2] !== null) {
+                $entry[] = $query[2][0] . ':' . $query[2][1];
+            }
+            $cost = 24 + (isset($entry[2]) ? strlen($entry[2]) + 3 : 0);
+            if (!isset($sql[$hash])) {
+                $cost += strlen($normalized) + strlen($connection) + 40;
+            }
+            if ($entries !== [] && $size + $cost > $budget) {
+                $chunks[] = [$sql, $entries];
+                $sql = [];
+                $entries = [];
+                $size = 200;
+                $cost = 24 + (isset($entry[2]) ? strlen($entry[2]) + 3 : 0) + strlen($normalized) + strlen($connection) + 40;
+            }
+            if (!isset($sql[$hash])) {
+                $sql[$hash] = ['sql' => $normalized, 'connection' => $connection];
+            }
+            $entries[] = $entry;
+            $size += $cost;
+        }
+        if ($entries !== []) {
+            $chunks[] = [$sql, $entries];
+        }
+
+        $lines = [];
+        foreach ($chunks as $chunk) {
+            $lines[] = $this->encode([
+                't' => 'queries',
+                'v' => self::RECORD_VERSION,
+                'trace' => $execution->trace,
+                'partial' => !$final,
+                'sql' => $chunk[0],
+                'q' => $chunk[1],
+            ]);
+        }
+
+        return $lines;
+    }
+
+    /**
+     * @return array{0: string, 1: string, 2: string} [hash, normalized redacted sql, connection]
+     */
+    private function statement(Execution $execution, string $key): array
+    {
+        if (!isset($this->normalized[$key])) {
+            if (count($this->normalized) >= 5000) {
+                $this->normalized = [];
+            }
+            $statement = $execution->statements[$key] ?? null;
+            $connection = $statement !== null ? $statement[0] : '';
+            $raw = $statement !== null ? $statement[1] : '';
+            $normalized = SqlNormalizer::normalize($raw);
+            $this->normalized[$key] = [
+                SqlNormalizer::hash($connection, $normalized),
+                $this->redactor->redactPatterns($normalized),
+                $connection,
+            ];
+        }
+
+        return $this->normalized[$key];
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function totals(Execution $execution): array
+    {
+        $totals = [
+            'queries' => $execution->queryCount,
+            'query_ms' => round($execution->queryMs, 2),
+            'queries_detail' => $execution->keepQueries || $execution->errored,
+            'outgoing' => $execution->outgoingCount,
+            'outgoing_ms' => round($execution->outgoingMs, 2),
+            'logs' => $execution->logCount,
+            'exceptions' => $execution->exceptionCount,
+        ];
+        $dropped = array_filter($execution->dropped);
+        if ($dropped !== []) {
+            $totals['dropped'] = $dropped;
+        }
+
+        return $totals;
+    }
+
+    // ------------------------------------------------------------------
+    // Partial flushes (long jobs)
+    // ------------------------------------------------------------------
+
+    private function maybeFlush(Execution $execution): void
+    {
+        if ($execution->kind !== 'job' || $execution->pending === 0) {
+            return;
+        }
+        $records = (int) $execution->setting('jobs.flush_records', 500);
+        $seconds = (float) $execution->setting('jobs.flush_seconds', 30);
+        $due = ($records > 0 && $execution->pending >= $records)
+            || ($seconds > 0 && $this->now() - $execution->lastFlushAt >= $seconds);
+        if (!$due) {
+            return;
+        }
+
+        $lines = $this->detailLines($execution, false);
+        $this->write($lines);
+
+        if ($execution->keepQueries) {
+            $execution->meta['_queries_flushed'] = (int) ($execution->meta['_queries_flushed'] ?? 0) + count($execution->queries);
+            $execution->queries = [];
+        }
+        $execution->meta['_outgoing_flushed'] = (int) ($execution->meta['_outgoing_flushed'] ?? 0) + count($execution->outgoing);
+        $execution->meta['_logs_flushed'] = (int) ($execution->meta['_logs_flushed'] ?? 0) + count($execution->logs);
+        $execution->slowQueries = [];
+        $execution->outgoing = [];
+        $execution->logs = [];
+        $execution->exceptions = [];
+        $execution->pending = 0;
+        $execution->lastFlushAt = $this->now();
+        $execution->flushes++;
+    }
+
+    // ------------------------------------------------------------------
+    // Helpers
+    // ------------------------------------------------------------------
+
+    private function newExecution(string $kind, ?string $parent, array $config): Execution
+    {
+        $this->registerShutdown();
+        $queries = isset($config['queries']) && is_array($config['queries']) ? $config['queries'] : [];
+        $mode = (string) ($queries['mode'] ?? 'sampled');
+        $rate = (float) ($queries['sample_rate'] ?? 0.1);
+        $keep = $mode === 'all' || ($mode === 'sampled' && call_user_func($this->random) < $rate);
+
+        return new Execution($kind, self::newTrace(), $parent, $this->now(), $config, $keep);
+    }
+
+    private function registerShutdown(): void
+    {
+        if ($this->shutdownRegistered) {
+            return;
+        }
+        $this->shutdownRegistered = true;
+        register_shutdown_function([$this, 'shutdown']);
+    }
+
+    private function remove(Execution $execution): void
+    {
+        foreach ($this->stack as $i => $candidate) {
+            if ($candidate === $execution) {
+                array_splice($this->stack, $i, 1);
+
+                return;
+            }
+        }
+    }
+
+    /**
+     * @param array<int, string|null> $lines
+     */
+    private function write(array $lines): void
+    {
+        $lines = array_values(array_filter($lines, 'is_string'));
+        if ($lines !== []) {
+            $this->sink->write($lines);
+        }
+    }
+
+    /**
+     * Encode one record, shrinking it if it is larger than max_record_bytes.
+     *
+     * @param array<string, mixed> $record
+     */
+    public function encode(array $record): ?string
+    {
+        $limit = (int) $this->setting('spool.max_record_bytes', 32768);
+        $json = self::json($record);
+        if ($json !== null && strlen($json) <= $limit) {
+            return $json;
+        }
+
+        // Drop or cut the bulky parts, biggest offenders first.
+        $steps = [
+            function (array $r) {
+                unset($r['request_body'], $r['response_body'], $r['request_headers']);
+
+                return $r;
+            },
+            function (array $r) {
+                if (isset($r['context'])) {
+                    $r['context'] = ['_truncated' => true];
+                }
+                if (isset($r['frames'])) {
+                    $r['frames'] = array_slice($r['frames'], 0, 10);
+                }
+
+                return $r;
+            },
+            function (array $r) {
+                foreach (['message', 'sql', 'error'] as $key) {
+                    if (isset($r[$key]) && is_string($r[$key])) {
+                        $r[$key] = Text::limit($r[$key], 1000);
+                    }
+                }
+                unset($r['previous']);
+
+                return $r;
+            },
+        ];
+        foreach ($steps as $step) {
+            $record = $step($record);
+            $record['_truncated'] = true;
+            $json = self::json($record);
+            if ($json !== null && strlen($json) <= $limit) {
+                return $json;
+            }
+        }
+
+        return self::json([
+            't' => $record['t'] ?? 'unknown',
+            'v' => self::RECORD_VERSION,
+            'trace' => $record['trace'] ?? null,
+            'at' => $record['at'] ?? $this->iso($this->now()),
+            '_truncated' => true,
+        ]);
+    }
+
+    private static function json(array $record): ?string
+    {
+        $json = json_encode(
+            $record,
+            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE | JSON_PARTIAL_OUTPUT_ON_ERROR | JSON_PRESERVE_ZERO_FRACTION
+        );
+
+        return is_string($json) ? $json : null;
+    }
+
+    private function body(string $body, int $maxBytes): string
+    {
+        // Redact before cutting, so a secret is never split in two.
+        return Text::limitBytes($this->redactor->redactBody(Text::limitBytes($body, $maxBytes * 4)), $maxBytes);
+    }
+
+    /**
+     * @param mixed $message
+     */
+    private function stringify($message): string
+    {
+        if (is_string($message)) {
+            return $message;
+        }
+        if (is_scalar($message) || $message === null) {
+            return var_export($message, true);
+        }
+        if (is_object($message) && method_exists($message, '__toString')) {
+            return (string) $message;
+        }
+        $json = self::json(['m' => $this->normalizeValue($message, 0)]);
+
+        return $json === null ? '' : substr($json, 5, -1);
+    }
+
+    /**
+     * Turn log context into plain arrays and scalars, never exposing object
+     * internals. Throwables are summarised (they get their own record).
+     *
+     * @return array<string, mixed>
+     */
+    private function normalizeContext(array $context): array
+    {
+        $normalized = $this->normalizeValue($context, 0);
+
+        return is_array($normalized) ? $normalized : [];
+    }
+
+    /**
+     * @param mixed $value
+     * @return mixed
+     */
+    private function normalizeValue($value, int $depth)
+    {
+        if ($value === null || is_bool($value) || is_int($value)) {
+            return $value;
+        }
+        if (is_float($value)) {
+            return is_finite($value) ? $value : (string) $value;
+        }
+        if (is_string($value)) {
+            return Text::limit($value, self::MESSAGE_MAX);
+        }
+        if ($depth >= self::CONTEXT_MAX_DEPTH) {
+            return '[depth limit]';
+        }
+        if (is_array($value)) {
+            $out = [];
+            $i = 0;
+            foreach ($value as $key => $item) {
+                if ($i++ >= self::CONTEXT_MAX_ITEMS) {
+                    $out['_more'] = count($value) - self::CONTEXT_MAX_ITEMS;
+                    break;
+                }
+                $out[$key] = $this->normalizeValue($item, $depth + 1);
+            }
+
+            return $out;
+        }
+        if ($value instanceof \Throwable) {
+            return [
+                'class' => get_class($value),
+                'message' => Text::limit((string) $value->getMessage(), 1000),
+                'file' => $this->location->relative((string) $value->getFile()),
+                'line' => (int) $value->getLine(),
+            ];
+        }
+        if ($value instanceof \DateTimeInterface) {
+            return $value->format(DATE_ATOM);
+        }
+        if ($value instanceof \JsonSerializable) {
+            return $this->normalizeValue($value->jsonSerialize(), $depth + 1);
+        }
+        if (is_object($value) && method_exists($value, 'toArray')) {
+            return $this->normalizeValue($value->toArray(), $depth + 1);
+        }
+        if (is_object($value) && method_exists($value, '__toString')) {
+            return Text::limit((string) $value, self::MESSAGE_MAX);
+        }
+        if (is_object($value)) {
+            return ['class' => get_class($value)];
+        }
+
+        return gettype($value);
+    }
+
+    private function stripQuery(string $url): string
+    {
+        $cut = strcspn($url, '?#');
+
+        return substr($url, 0, $cut);
+    }
+
+    private function elapsedMs(Execution $execution): float
+    {
+        return round(($this->now() - $execution->startedAt) * 1000, 2);
+    }
+
+    public function elapsedMsFor(Execution $execution): float
+    {
+        return $this->elapsedMs($execution);
+    }
+
+    private function now(): float
+    {
+        return (float) call_user_func($this->clock);
+    }
+
+    private function iso(float $time): string
+    {
+        $seconds = (int) floor($time);
+        $millis = (int) floor(($time - $seconds) * 1000);
+
+        return gmdate('Y-m-d\TH:i:s', $seconds) . sprintf('.%03dZ', $millis);
+    }
+
+    /**
+     * @param mixed $default
+     * @return mixed
+     */
+    public function setting(string $path, $default = null)
+    {
+        $value = $this->config;
+        foreach (explode('.', $path) as $segment) {
+            if (!is_array($value) || !array_key_exists($segment, $value)) {
+                return $default;
+            }
+            $value = $value[$segment];
+        }
+
+        return $value;
+    }
+
+    /**
+     * @param array<string, mixed> $config
+     * @param array<string, mixed> $overrides "queries.mode" => "all", ...
+     * @return array<string, mixed>
+     */
+    public static function applyOverrides(array $config, array $overrides): array
+    {
+        foreach ($overrides as $path => $value) {
+            $segments = explode('.', (string) $path);
+            $target = &$config;
+            foreach ($segments as $segment) {
+                if (!isset($target[$segment]) || !is_array($target[$segment])) {
+                    $target[$segment] = isset($target[$segment]) && is_array($target[$segment]) ? $target[$segment] : [];
+                }
+                $target = &$target[$segment];
+            }
+            $target = $value;
+            unset($target);
+        }
+
+        return $config;
+    }
+
+    public static function newTrace(): string
+    {
+        try {
+            return bin2hex(random_bytes(8));
+        } catch (\Throwable $e) {
+            return substr(md5(uniqid('', true)), 0, 16);
+        }
+    }
+
+    /**
+     * @return array{type: int, message: string, file: string, line: int}|null
+     */
+    private static function fatalError(): ?array
+    {
+        $error = error_get_last();
+        if (!is_array($error)) {
+            return null;
+        }
+
+        return in_array($error['type'] ?? 0, [E_ERROR, E_CORE_ERROR, E_COMPILE_ERROR, E_PARSE, E_USER_ERROR], true) ? $error : null;
+    }
+}

@@ -2,22 +2,25 @@
 
 namespace DevZone\LogMonitor\Transport;
 
-use Illuminate\Support\Facades\Http;
+use GuzzleHttp\Client;
+use GuzzleHttp\HandlerStack;
 
 /**
- * POSTs a batch of entries to the monitoring server.
+ * POSTs one batch to the monitoring server.
  *
- * - https only; plain http endpoints are rejected before any request is made,
- *   unless allow_http is set and the application is not in production
- * - TLS verification is never disabled
+ * - https only; plain http only with allow_http AND a development APP_ENV
+ * - TLS verification is never disabled, redirects are never followed
  * - the API key travels in the Authorization header only
- * - 10 second timeout, no in-request retries
- * - never throws: failures are reported via error_log() and return false
+ * - never throws; the result says whether to retry
+ *
+ * Uses Guzzle directly rather than Laravel's Http:: client so the package's
+ * own uploads are never captured as outgoing calls of the host app.
  */
-final class HttpTransport
+class HttpTransport implements Transport
 {
     const DEFAULT_TIMEOUT = 10;
-    const USER_AGENT = 'devzone-log-monitor/1.0';
+    const USER_AGENT = 'devzone-log-monitor/2';
+    const HTTP_ALLOWED_ENVIRONMENTS = ['local', 'development', 'dev', 'testing'];
 
     /** @var string */
     private $endpoint;
@@ -28,50 +31,44 @@ final class HttpTransport
     /** @var int */
     private $timeout;
 
-    /** @var string|null */
-    private $app;
-
-    /** @var bool Plain http accepted (local development only, decided by the caller). */
+    /** @var bool */
     private $allowHttp;
 
-    public function __construct(
-        string $endpoint,
-        string $apiKey,
-        int $timeout = self::DEFAULT_TIMEOUT,
-        ?string $app = null,
-        bool $allowHttp = false
-    ) {
+    /** @var bool */
+    private $gzip;
+
+    /** @var HandlerStack|callable|null */
+    private $handler;
+
+    /**
+     * @param HandlerStack|callable|null $handler Guzzle handler (tests)
+     */
+    public function __construct(string $endpoint, string $apiKey, int $timeout = self::DEFAULT_TIMEOUT, bool $allowHttp = false, bool $gzip = true, $handler = null)
+    {
         $this->endpoint = trim($endpoint);
         $this->apiKey = trim($apiKey);
         $this->timeout = max(1, $timeout);
-        $this->app = $app;
         $this->allowHttp = $allowHttp;
+        $this->gzip = $gzip && function_exists('gzencode');
+        $this->handler = $handler;
     }
 
     /**
-     * Environments in which the allow_http flag is honoured at all.
+     * @param array<string, mixed> $config Full log-monitor config.
+     * @param HandlerStack|callable|null $handler
      */
-    const HTTP_ALLOWED_ENVIRONMENTS = ['local', 'development', 'dev', 'testing'];
-
-    /**
-     * @param array<string, mixed> $config The full log-monitor config array.
-     * @param string|null $environment The application environment (APP_ENV).
-     */
-    public static function fromConfig(array $config, ?string $environment = null): self
+    public static function fromConfig(array $config, ?string $environment = null, $handler = null): self
     {
         return new self(
             (string) ($config['endpoint'] ?? ''),
             (string) ($config['api_key'] ?? ''),
             (int) ($config['timeout'] ?? self::DEFAULT_TIMEOUT),
-            isset($config['app']) && is_string($config['app']) ? $config['app'] : null,
-            self::httpAllowedFor(!empty($config['allow_http']), $environment)
+            self::httpAllowedFor(!empty($config['allow_http']), $environment),
+            (bool) ($config['shipping']['gzip'] ?? true),
+            $handler
         );
     }
 
-    /**
-     * http is only ever allowed when explicitly requested AND the environment
-     * is a development one. Production can never be downgraded by the flag.
-     */
     public static function httpAllowedFor(bool $flag, ?string $environment): bool
     {
         return $flag
@@ -80,16 +77,8 @@ final class HttpTransport
     }
 
     /**
-     * Whether this transport will send to its configured endpoint.
-     */
-    public function endpointAllowed(): bool
-    {
-        return self::isSecureEndpoint($this->endpoint, $this->allowHttp);
-    }
-
-    /**
-     * Only absolute https URLs with a host and no embedded credentials pass.
-     * With $allowHttp, plain http is accepted as well.
+     * Absolute https URL with a host and no embedded credentials; plain http
+     * too when $allowHttp.
      */
     public static function isSecureEndpoint(string $url, bool $allowHttp = false): bool
     {
@@ -113,78 +102,81 @@ final class HttpTransport
         return $this->endpoint !== '' && $this->apiKey !== '';
     }
 
-    /**
-     * @param array<int, array<string, mixed>> $entries Already-redacted entries.
-     */
-    public function send(array $entries): bool
+    public function endpointAllowed(): bool
     {
-        if ($entries === []) {
-            return true;
-        }
-        if (!$this->isConfigured()) {
-            error_log('[log-monitor] transport not configured: endpoint or api key missing');
+        return self::isSecureEndpoint($this->endpoint, $this->allowHttp);
+    }
 
-            return false;
+    public function host(): ?string
+    {
+        $host = parse_url($this->endpoint, PHP_URL_HOST);
+
+        return is_string($host) ? $host : null;
+    }
+
+    public function send(string $json): array
+    {
+        if (!$this->isConfigured()) {
+            return self::result(false, null, false, 'endpoint or api key not configured');
         }
         if (!$this->endpointAllowed()) {
-            error_log('[log-monitor] refusing to ship to a non-https endpoint');
-
-            return false;
+            return self::result(false, null, false, 'endpoint rejected: must be an absolute https URL');
         }
         if (strpos($this->endpoint, $this->apiKey) !== false) {
-            error_log('[log-monitor] refusing to ship: the API key must not appear in the endpoint URL');
-
-            return false;
+            return self::result(false, null, false, 'the API key must not appear in the endpoint URL');
         }
 
-        $payload = [
-            'app' => $this->app,
-            'sent_at' => (new \DateTimeImmutable('now'))->format('Y-m-d\TH:i:s.vP'),
-            'count' => count($entries),
-            'entries' => array_values($entries),
+        $headers = [
+            'Authorization' => 'Bearer ' . $this->apiKey,
+            'Content-Type' => 'application/json',
+            'Accept' => 'application/json',
+            'User-Agent' => self::USER_AGENT,
         ];
+        $body = $json;
+        if ($this->gzip) {
+            $compressed = gzencode($json, 6);
+            if (is_string($compressed)) {
+                $body = $compressed;
+                $headers['Content-Encoding'] = 'gzip';
+            }
+        }
 
         try {
-            $response = Http::withToken($this->apiKey)
-                ->withHeaders(['User-Agent' => self::USER_AGENT])
-                ->withOptions(['verify' => true, 'allow_redirects' => false])
-                ->timeout($this->timeout)
-                ->acceptJson()
-                ->post($this->endpoint, $payload);
-
-            if ($response->successful()) {
-                return true;
+            $options = [];
+            if ($this->handler !== null) {
+                $options['handler'] = $this->handler;
+            }
+            $client = new Client($options);
+            $response = $client->request('POST', $this->endpoint, [
+                'headers' => $headers,
+                'body' => $body,
+                'timeout' => $this->timeout,
+                'connect_timeout' => min(5, $this->timeout),
+                'verify' => true,
+                'allow_redirects' => false,
+                'http_errors' => false,
+            ]);
+            $status = $response->getStatusCode();
+            if ($status >= 200 && $status < 300) {
+                return self::result(true, $status, false, null);
             }
 
-            error_log(sprintf(
-                '[log-monitor] monitoring server responded with HTTP %d for a batch of %d entries',
-                $response->status(),
-                count($entries)
-            ));
+            // 408 timeout, 425/429 throttling, 5xx: the server may recover.
+            // Other 4xx mean this batch or this configuration is rejected.
+            $retryable = $status === 408 || $status === 425 || $status === 429 || $status >= 500;
 
-            return false;
+            return self::result(false, $status, $retryable, 'HTTP ' . $status);
         } catch (\Throwable $e) {
-            error_log('[log-monitor] transport error: ' . get_class($e) . ': ' . $this->sanitize($e->getMessage()));
-
-            return false;
+            return self::result(false, null, true, $this->sanitize(get_class($e) . ': ' . $e->getMessage()));
         }
     }
 
-    /**
-     * Remove the API key from any text that might be logged or displayed.
-     */
     public function sanitize(string $text): string
     {
-        if ($this->apiKey === '') {
-            return $text;
-        }
-
-        return str_replace($this->apiKey, '[REDACTED]', $text);
+        return $this->apiKey === '' ? $text : str_replace($this->apiKey, '[REDACTED]', $text);
     }
 
     /**
-     * Keep the key out of var_dump() / dd() output.
-     *
      * @return array<string, mixed>
      */
     public function __debugInfo()
@@ -193,8 +185,16 @@ final class HttpTransport
             'endpoint' => $this->endpoint,
             'api_key' => $this->apiKey === '' ? '' : '***',
             'timeout' => $this->timeout,
-            'app' => $this->app,
             'allow_http' => $this->allowHttp,
+            'gzip' => $this->gzip,
         ];
+    }
+
+    /**
+     * @return array{ok: bool, status: int|null, retryable: bool, error: string|null}
+     */
+    private static function result(bool $ok, ?int $status, bool $retryable, ?string $error): array
+    {
+        return ['ok' => $ok, 'status' => $status, 'retryable' => $retryable, 'error' => $error];
     }
 }

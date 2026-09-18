@@ -141,6 +141,9 @@ final class Redactor
         if ($this->stripTraceArguments) {
             $value = $this->stripTraceArguments($value);
         }
+        if (strpos($value, '<') !== false && strpos($value, '</') !== false) {
+            $value = $this->redactXmlElements($value);
+        }
         if ($this->keyValuePattern !== null) {
             $replaced = @preg_replace($this->keyValuePattern, '$1$2$3$4' . $this->replacementForRegex(), $value);
             if (is_string($replaced)) {
@@ -155,6 +158,43 @@ final class Redactor
         }
 
         return $value;
+    }
+
+    /**
+     * Only the regex patterns (emails, cards, CNICs, hashes), without the
+     * key=value and SQL handling. Used for SQL text, whose literals are
+     * already masked and whose column names must stay readable.
+     */
+    public function redactPatterns(string $value): string
+    {
+        foreach ($this->patterns as $pattern) {
+            $replaced = @preg_replace($pattern, $this->replacementForRegex(), $value);
+            if (is_string($replaced)) {
+                $value = $replaced;
+            }
+        }
+
+        return $value;
+    }
+
+    /**
+     * Redact a body of unknown format: JSON is decoded and redacted by key,
+     * anything else (form data, XML/SOAP, text) goes through redactString.
+     */
+    public function redactBody(string $body): string
+    {
+        $trimmed = ltrim($body);
+        if ($trimmed !== '' && ($trimmed[0] === '{' || $trimmed[0] === '[')) {
+            $decoded = json_decode($body, true);
+            if (is_array($decoded)) {
+                $encoded = json_encode($this->redact($decoded), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR);
+                if (is_string($encoded)) {
+                    return $encoded;
+                }
+            }
+        }
+
+        return $this->redactString($body);
     }
 
     public function isSensitiveKey(string $key): bool
@@ -242,6 +282,29 @@ final class Redactor
      *   #3 /app/Http/Controllers/AuthController.php(42): App\Auth->login('john', 'hunter2')
      * The argument list carries raw scalars, so replace it with "(...)".
      */
+    /**
+     * <Password>x</Password>, <ns:CardPin>1234</ns:CardPin>: replace the text
+     * of elements whose (local) name is sensitive. Attributes are covered by
+     * the key=value rule.
+     */
+    private function redactXmlElements(string $value): string
+    {
+        $replacement = $this->replacement;
+        $result = @preg_replace_callback(
+            '/<((?:[A-Za-z_][\w.-]*:)?([A-Za-z_][\w.-]*))(\s[^<>]*)?>([^<]*)<\/\1\s*>/',
+            function (array $m) use ($replacement) {
+                if ($m[4] === '' || !$this->isSensitiveKey($m[2])) {
+                    return $m[0];
+                }
+
+                return '<' . $m[1] . $m[3] . '>' . $replacement . '</' . $m[1] . '>';
+            },
+            $value
+        );
+
+        return is_string($result) ? $result : $value;
+    }
+
     private function stripTraceArguments(string $value): string
     {
         if (!preg_match('/^#\d+ /m', $value)) {

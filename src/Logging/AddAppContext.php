@@ -8,6 +8,11 @@ use Monolog\Handler\ProcessableHandlerInterface;
 use Monolog\Logger as MonologLogger;
 
 /**
+ * @deprecated v1 only. v2 captures logs from Laravel's log events and never
+ *             reads log files, so this tap is no longer needed. It is kept
+ *             so upgraded apps whose logging.php still references it do
+ *             not break; remove the tap to get plain log lines back.
+ *
  * Laravel logging "tap".
  *
  *   'daily' => [

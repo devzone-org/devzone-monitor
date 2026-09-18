@@ -122,6 +122,23 @@ final class RedactorTest extends TestCase
         $this->assertSame('x (SQL: select 1 where a = b)', $redactor->redactString('x (SQL: select 1 where a = b)'));
     }
 
+    public function testXmlSoapElementsAreRedactedByName(): void
+    {
+        $xml = '<soapenv:Body><ns:Verify><ns:AccountNo>0011223344</ns:AccountNo><ns:Pin type="x">4321</ns:Pin><ns:Name>Bob</ns:Name></ns:Verify></soapenv:Body>';
+
+        $this->assertSame(
+            '<soapenv:Body><ns:Verify><ns:AccountNo>[REDACTED]</ns:AccountNo><ns:Pin type="x">[REDACTED]</ns:Pin><ns:Name>Bob</ns:Name></ns:Verify></soapenv:Body>',
+            $this->redactor->redactString($xml)
+        );
+    }
+
+    public function testBodiesAreRedactedByFormat(): void
+    {
+        $this->assertSame('{"cnic":"[REDACTED]","amount":100}', $this->redactor->redactBody('{"cnic":"3520212345671","amount":100}'));
+        $this->assertSame('pin=[REDACTED]&amount=100', $this->redactor->redactBody('pin=4321&amount=100'));
+        $this->assertSame('where email = ? -- [REDACTED]', $this->redactor->redactPatterns('where email = ? -- bob@example.com'));
+    }
+
     public function testNonStringScalarsPassThrough(): void
     {
         $this->assertSame([1, 2.5, true, null], $this->redactor->redact([1, 2.5, true, null]));
