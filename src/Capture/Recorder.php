@@ -1107,7 +1107,7 @@ class Recorder
                 continue;
             }
 
-            if (in_array(strtolower($name), $secretNames, true) || $this->redactor->isSensitiveKey($name)) {
+            if ($this->redactor->isSecretName($name, $secretNames)) {
                 $value = $replacement;
                 $meta['redacted'] = true;
             } else {
@@ -1146,12 +1146,13 @@ class Recorder
     {
         $meta = ['redacted' => false, 'cut' => count($headers) > 100 ? 'kept 100 of ' . count($headers) . ' headers' : null];
         $sensitive = array_map('strtolower', (array) $this->setting('redact.headers', []));
+        $secretNames = (array) $this->setting('redact.query_keys', []);
         $replacement = (string) $this->setting('redact.replacement', '[REDACTED]');
         $out = [];
         foreach (array_slice($headers, 0, 100, true) as $name => $values) {
             $name = strtolower((string) $name);
             $value = is_array($values) ? implode(', ', array_map('strval', $values)) : (string) $values;
-            if (in_array($name, $sensitive, true)) {
+            if (in_array($name, $sensitive, true) || $this->redactor->isSecretName($name, $secretNames)) {
                 $out[$name] = $replacement;
                 $meta['redacted'] = true;
                 continue;

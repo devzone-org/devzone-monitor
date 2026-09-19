@@ -211,6 +211,44 @@ final class RecorderTest extends TestCase
         $this->assertArrayNotHasKey('response_body', $call);
     }
 
+    public function testHeadersNamedLikeSecretsAreMasked(): void
+    {
+        $recorder = $this->recorder(['redact' => [
+            'headers' => ['authorization'],
+            'query_keys' => ['key', 'apikey', 'signature', 'auth', 'passwd', 'session'],
+            'replacement' => '[REDACTED]',
+        ]]);
+
+        $out = $recorder->headers([
+            'key' => 'Riz-Remit',
+            'host' => 'back-office.frontier-pay.com',
+            'email' => 'ops@rizremit.com',
+            'password' => 'Riz@Fpay~2!2!3#',
+            'X-Api-Key' => 'k-1',
+            'X-Auth-Token' => 't',
+            'X-Signature' => 's',
+            'Api-Secret' => 's',
+            'X-Session-Id' => 'abc',
+            'User-Agent' => 'GuzzleHttp/7',
+            'Accept' => 'application/json',
+        ], $meta);
+
+        $this->assertSame([
+            'key' => '[REDACTED]',
+            'host' => 'back-office.frontier-pay.com',
+            'email' => '[REDACTED]',
+            'password' => '[REDACTED]',
+            'x-api-key' => '[REDACTED]',
+            'x-auth-token' => '[REDACTED]',
+            'x-signature' => '[REDACTED]',
+            'api-secret' => '[REDACTED]',
+            'x-session-id' => '[REDACTED]',
+            'user-agent' => 'GuzzleHttp/7',
+            'accept' => 'application/json',
+        ], $out);
+        $this->assertTrue($meta['redacted']);
+    }
+
     public function testOutgoingHeadersCanBeTurnedOff(): void
     {
         $recorder = $this->recorder(['outgoing.headers' => false]);

@@ -234,9 +234,10 @@ return [
         'sql_bindings' => true,
         'trace_arguments' => true,
         'headers' => ['authorization', 'cookie', 'set-cookie', 'x-xsrf-token', 'x-csrf-token', 'proxy-authorization'],
-        // Query parameters: the keys above plus names that usually carry a
-        // secret in a URL.
-        'query_keys' => ['key', 'api_key', 'apikey', 'access_token', 'signature', 'sig', 'otp', 'code', 'hash'],
+        // Header and query parameter names masked on top of the keys above
+        // (matched by words: "x-api-key" matches "key"). Headers in the
+        // "headers" list are always masked too.
+        'query_keys' => ['key', 'apikey', 'access_token', 'signature', 'sig', 'otp', 'code', 'hash', 'auth', 'passwd', 'pwd', 'credential', 'credentials', 'session', 'private'],
     ],
 
 ];

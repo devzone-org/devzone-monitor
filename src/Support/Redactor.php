@@ -197,6 +197,29 @@ final class Redactor
         return $this->redactString($body);
     }
 
+    /**
+     * A header or query parameter name that carries a secret: a sensitive
+     * key (redact.keys: password, token, pin...) or one of $extra, matched
+     * by words, so "x-api-key" matches "api_key" and "key", and
+     * "X-Auth-Password" matches "password".
+     *
+     * @param array<int, string> $extra
+     */
+    public function isSecretName(string $name, array $extra = []): bool
+    {
+        if ($this->isSensitiveKey($name)) {
+            return true;
+        }
+        $tokens = self::tokenize($name);
+        foreach ($extra as $key) {
+            if (self::containsSequence($tokens, self::tokenize((string) $key))) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     public function isSensitiveKey(string $key): bool
     {
         $tokens = self::tokenize($key);
