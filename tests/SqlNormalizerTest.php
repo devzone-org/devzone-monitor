@@ -31,6 +31,49 @@ final class SqlNormalizerTest extends TestCase
         }
     }
 
+    public function testDialects(): void
+    {
+        $cases = [
+            ['pgsql', 'select * from "users" where "id" = 5 and name = \'x\'', 'select * from "users" where "id" = ? and name = ?'],
+            ['pgsql', 'select $$secret$$, $body$it\'s$body$, $1 from t', 'select ?, ?, $1 from t'],
+            ['pgsql', "select E'a\\'b', U&'x' from t", 'select ?, ? from t'],
+            ['pgsql', "select 'a\\' from t", 'select ? from t'],
+            ['mysql', 'select `a` from t where b = "x" and c in ("y", \'z\') -- note', 'select `a` from t where b = ? and c in (...)'],
+            ['mysql', "select 1 # note\nfrom t where a = _utf8mb4'x' and b = X'4C' and c = 0x1F", 'select ? from t where a = ? and b = ? and c = ?'],
+            ['sqlsrv', "select * from [dbo].[t2] where x = N'y'", 'select * from [dbo].[t2] where x = ?'],
+            ['sqlite', 'select "a" from `t` where b = \'c\' /* note */', 'select "a" from `t` where b = ?'],
+        ];
+        foreach ($cases as [$driver, $sql, $expected]) {
+            $this->assertSame($expected, SqlNormalizer::normalize($sql, $driver), "{$driver}: {$sql}");
+        }
+    }
+
+    public function testUnclosedLiteralsAndCommentsAreNotKept(): void
+    {
+        foreach ([
+            ['mysql', "select * from t where a = 'secret"],
+            ['mysql', 'select * from t where a = "secret'],
+            ['pgsql', 'select $$secret'],
+            ['pgsql', 'select 1 /* secret'],
+            ['', "select 'a''"],
+        ] as [$driver, $sql]) {
+            $this->assertSame(SqlNormalizer::UNPARSED, SqlNormalizer::normalize($sql, $driver), $sql);
+        }
+    }
+
+    public function testLongStatementsAreMaskedBeforeTheyAreCut(): void
+    {
+        $sql = "select '" . str_repeat('a', 9990) . "secretword' as a, b from t";
+        $this->assertSame("select ? as a, b from t", SqlNormalizer::normalize($sql, 'mysql'));
+
+        $long = 'select ' . implode(', ', array_fill(0, 3000, 'col_name')) . " from t where a = 'secretword'";
+        $normalized = SqlNormalizer::normalize($long, 'mysql');
+        $this->assertLessThanOrEqual(SqlNormalizer::MAX_LENGTH + 4, strlen($normalized));
+        $this->assertStringNotContainsString('secretword', $normalized);
+
+        $this->assertSame(SqlNormalizer::TOO_LONG, SqlNormalizer::normalize(str_repeat('x', SqlNormalizer::MAX_INPUT + 1)));
+    }
+
     public function testSameShapeSameHash(): void
     {
         $a = SqlNormalizer::hash('mysql', SqlNormalizer::normalize("select * from users where id = 1"));

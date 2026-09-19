@@ -36,7 +36,8 @@ final class SpoolTest extends TestCase
             "{\"t\":\"request\",\"trace\":\"a\"}\n{\"t\":\"queries\",\"trace\":\"a\"}\n{\"t\":\"request\",\"trace\":\"b\"}\n",
             file_get_contents($this->dir . '/current.ndjson')
         );
-        $this->assertSame('0664', substr(sprintf('%o', fileperms($this->dir . '/current.ndjson')), -4), 'shared group can rename and delete');
+        $this->assertSame('0600', substr(sprintf('%o', fileperms($this->dir . '/current.ndjson')), -4), 'owner only by default');
+        $this->assertSame('0700', substr(sprintf('%o', fileperms($this->dir)), -4));
     }
 
     public function testWriterRotatesAtTheSizeLimit(): void
@@ -107,6 +108,96 @@ final class SpoolTest extends TestCase
         $this->assertSame(2, $dropped);
         $this->assertSame([$b], $directory->batches(), 'the newest batch survives');
         $this->assertFileDoesNotExist($a . '.progress');
+    }
+
+    public function testModesAndGroupAreConfigurable(): void
+    {
+        $writer = SpoolWriter::fromConfig(['path' => $this->dir, 'file_mode' => '0660', 'dir_mode' => '0770', 'rotate_bytes' => 0, 'min_free_disk' => 0]);
+        $writer->write(['{"t":"log"}']);
+        clearstatcache();
+        $this->assertSame('0660', substr(sprintf('%o', fileperms($this->dir . '/current.ndjson')), -4));
+        $this->assertSame('0770', substr(sprintf('%o', fileperms($this->dir)), -4));
+    }
+
+    public function testFilesFromOlderVersionsAreTightened(): void
+    {
+        $directory = new SpoolDirectory($this->dir);
+        $directory->ensure();
+        chmod($this->dir, 0775);
+        file_put_contents($this->dir . '/current.ndjson', "{\"t\":\"log\"}\n");
+        chmod($this->dir . '/current.ndjson', 0664);
+        $batch = $this->dir . '/batch-' . gmdate('Ymd-His') . '-aaaa.ndjson';
+        file_put_contents($batch, "{}\n");
+        chmod($batch, 0644);
+
+        $this->writer()->write(['{"t":"log"}']);
+        clearstatcache();
+        $this->assertSame('0600', substr(sprintf('%o', fileperms($this->dir . '/current.ndjson')), -4), 'the writer fixes current.ndjson');
+
+        $directory->tighten();
+        clearstatcache();
+        $this->assertSame('0600', substr(sprintf('%o', fileperms($batch)), -4));
+        $this->assertSame('0700', substr(sprintf('%o', fileperms($this->dir)), -4));
+    }
+
+    public function testQuarantinedBatchesCountTowardsTheCapsAndGoFirst(): void
+    {
+        $directory = new SpoolDirectory($this->dir);
+        $directory->ensure();
+        $failedOld = $this->dir . '/batch-' . gmdate('Ymd-His', time() - 10 * 86400) . '-ffff.ndjson';
+        $failedNew = $this->dir . '/batch-' . gmdate('Ymd-His', time() - 30) . '-eeee.ndjson';
+        $waiting = $this->dir . '/batch-' . gmdate('Ymd-His', time() - 120) . '-aaaa.ndjson';
+        file_put_contents($failedOld, str_repeat('f', 100));
+        file_put_contents($failedNew, str_repeat('e', 600));
+        file_put_contents($waiting, str_repeat('a', 600));
+        $directory->quarantine($failedOld);
+        $directory->quarantine($failedNew);
+
+        $dropped = @$directory->prune(1000, 7);
+
+        $this->assertSame(2, $dropped, 'the week-old failed batch by age, the newer one by size');
+        $this->assertSame([], $directory->failedBatches());
+        $this->assertSame([$waiting], $directory->batches(), 'a batch that can still be sent outlives failed ones');
+        $this->assertSame(['count' => 0, 'bytes' => 0, 'oldest' => null], $directory->failedSummary());
+    }
+
+    public function testPurgeRemovesEverythingIncludingQuarantined(): void
+    {
+        $directory = new SpoolDirectory($this->dir);
+        $this->writer()->write(['{"t":"log"}']);
+        $batch = $directory->rotateCurrent();
+        $this->writer()->write(['{"t":"log"}']);
+        file_put_contents($batch . '.progress', '{}');
+        $failed = $this->dir . '/batch-' . gmdate('Ymd-His') . '-ffff.ndjson';
+        file_put_contents($failed, '{}');
+        $directory->quarantine($failed);
+
+        $this->assertSame(3, $directory->purge());
+        $this->assertSame([], glob($this->dir . '/*.ndjson*'));
+        $this->assertSame([], $directory->failedBatches());
+    }
+
+    public function testAWriterNeverWaitsLongForTheLock(): void
+    {
+        $this->writer()->write(['{"n":1}']);
+        $holder = fopen($this->dir . '/current.ndjson', 'ab');
+        flock($holder, LOCK_EX);
+
+        $started = microtime(true);
+        @$this->writer()->write(['{"n":2}']);
+        $elapsed = microtime(true) - $started;
+
+        flock($holder, LOCK_UN);
+        fclose($holder);
+        $this->assertLessThan(0.5, $elapsed, 'gave up instead of blocking');
+        $this->assertSame("{\"n\":1}\n", file_get_contents($this->dir . '/current.ndjson'), 'the lines were dropped, nothing half-written');
+
+        $directory = new SpoolDirectory($this->dir);
+        $holder = fopen($this->dir . '/current.ndjson', 'ab');
+        flock($holder, LOCK_EX);
+        $this->assertNull($directory->read($this->dir . '/current.ndjson'), 'the shipper skips a busy file');
+        flock($holder, LOCK_UN);
+        fclose($holder);
     }
 
     public function testBatchNamesSortOldestFirst(): void

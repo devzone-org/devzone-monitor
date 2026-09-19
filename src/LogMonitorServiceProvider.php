@@ -23,7 +23,9 @@ use Illuminate\Support\ServiceProvider;
 
 class LogMonitorServiceProvider extends ServiceProvider
 {
-    const VERSION = '2.0.4';
+    /** Fallback when Composer's runtime API cannot tell (see version()). */
+    const VERSION = '2.1.0';
+    const PACKAGE = 'devzone/log-monitor';
     const CONFIG_PATH = __DIR__ . '/../config/log-monitor.php';
 
     public function register(): void
@@ -47,7 +49,12 @@ class LogMonitorServiceProvider extends ServiceProvider
                 (array) $app['config']->get('log-monitor', []),
                 $app->make(SpoolWriter::class),
                 $app->make(Redactor::class),
-                new Location($app->basePath())
+                new Location($app->basePath()),
+                null,
+                null,
+                function () use ($app) {
+                    return KillSwitch::isOn((string) $app['config']->get('log-monitor.kill_switch_path', ''));
+                }
             );
         });
 
@@ -69,7 +76,7 @@ class LogMonitorServiceProvider extends ServiceProvider
                     'env' => (string) $app->environment(),
                     'host' => (string) gethostname(),
                     'client' => $config['client'] ?? null,
-                    'package' => self::VERSION,
+                    'package' => self::version(),
                 ]
             );
         });
@@ -137,7 +144,11 @@ class LogMonitorServiceProvider extends ServiceProvider
             ]);
         }
 
-        if (!self::active($this->app['config']->get('log-monitor', []))) {
+        // Registered whenever enabled, even while log-monitor:off is in
+        // force: the recorder checks the switch as it runs, so a worker
+        // started while switched off resumes after log-monitor:on.
+        $config = $this->app['config']->get('log-monitor', []);
+        if (!is_array($config) || empty($config['enabled'])) {
             return;
         }
 
@@ -147,6 +158,25 @@ class LogMonitorServiceProvider extends ServiceProvider
         } catch (\Throwable $e) {
             Report::error('could not start log-monitor', $e);
         }
+    }
+
+    /**
+     * The installed version as Composer reports it, or VERSION.
+     */
+    public static function version(): string
+    {
+        try {
+            if (class_exists(\Composer\InstalledVersions::class) && \Composer\InstalledVersions::isInstalled(self::PACKAGE)) {
+                $version = \Composer\InstalledVersions::getPrettyVersion(self::PACKAGE);
+                if (is_string($version) && $version !== '') {
+                    return $version;
+                }
+            }
+        } catch (\Throwable $e) {
+            // Fall through to the constant.
+        }
+
+        return self::VERSION;
     }
 
     /**

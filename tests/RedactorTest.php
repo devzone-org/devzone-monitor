@@ -109,6 +109,7 @@ final class RedactorTest extends TestCase
     {
         $redactor = Redactor::fromConfig([
             'keys' => ['ssn'],
+            'replace_default_keys' => true,
             'patterns' => ['/\bACME-\d+\b/'],
             'replacement' => '***',
             'sql_bindings' => false,
@@ -132,11 +133,59 @@ final class RedactorTest extends TestCase
         );
     }
 
-    public function testBodiesAreRedactedByFormat(): void
+    public function testPatternsAloneLeaveSqlReadable(): void
     {
-        $this->assertSame('{"cnic":"[REDACTED]","amount":100}', $this->redactor->redactBody('{"cnic":"3520212345671","amount":100}'));
-        $this->assertSame('pin=[REDACTED]&amount=100', $this->redactor->redactBody('pin=4321&amount=100'));
         $this->assertSame('where email = ? -- [REDACTED]', $this->redactor->redactPatterns('where email = ? -- bob@example.com'));
+    }
+
+    public function testConfiguredKeysAreAddedToTheDefaults(): void
+    {
+        $redactor = Redactor::fromConfig(['keys' => ['employee_code'], 'patterns' => ['/\bACME-\d+\b/']]);
+
+        $out = $redactor->redact(['employee_code' => 'E1', 'password' => 'p', 'api_key' => 'k', 'note' => 'ACME-42 for bob@example.com']);
+        $this->assertSame(['employee_code' => '[REDACTED]', 'password' => '[REDACTED]', 'api_key' => '[REDACTED]', 'note' => '[REDACTED] for [REDACTED]'], $out);
+    }
+
+    public function testUrlsLoseTokensCredentialsAndSecretParameters(): void
+    {
+        $this->assertSame('https://app.test/password/reset/{token}', $this->redactor->redactUrl('https://app.test/password/reset/9f86d081884c7d659a2feaa0c55ad015a3bf4f1b#x'));
+        $this->assertSame('https://app.test/users/42/posts/how-to-do-it', $this->redactor->redactUrl('https://app.test/users/42/posts/how-to-do-it'));
+        $this->assertSame('https://[REDACTED]@db.example/app', $this->redactor->redactUrl('https://root:hunter2@db.example/app'));
+        $this->assertSame('/verify/{token}?expires=1&signature=[REDACTED]', $this->redactor->redactUrl('/verify/Ab12Cd34Ef56Gh78Ij90?expires=1&signature=abc'));
+        $this->assertSame('/api/token/{token}', $this->redactor->redactPath('/api/token/abc123'), 'a value after a secret-named segment');
+        $this->assertSame('https://files.example/signed/{token}/report.pdf', $this->redactor->redactUrl('https://files.example/signed/SEC-SIGNED-1/report.pdf'));
+        $this->assertSame('/verify/email', $this->redactor->redactPath('/verify/email'));
+        $this->assertSame('/users/{redacted}', $this->redactor->redactPath('/users/bob@example.com'));
+
+        $custom = Redactor::fromConfig(['path_patterns' => ['#(?<=/invite/)[a-z]+#']]);
+        $this->assertSame('/invite/{token}', $custom->redactPath('/invite/abcdefgh'));
+    }
+
+    public function testFreeTextKeyValueForms(): void
+    {
+        $cases = [
+            'userPassword: "two words"' => 'userPassword: "[REDACTED]"',
+            'user%5Bpassword%5D=x&a=1' => 'user%5Bpassword%5D=[REDACTED]&a=1',
+            '{\"api_key\":\"k-1\",\"a\":1}' => '{\"api_key\":\"[REDACTED]\",\"a\":1}',
+            '{"otp": "12 34' => '{"otp": "[REDACTED]',
+            'see https://x.test/cb?code=abc&page=2.' => 'see https://x.test/cb?code=[REDACTED]&page=2.',
+            '<Credentials><User>a</User><Pass>b</Pass></Credentials> <Pin><![CDATA[1234]]></Pin>' => '<Credentials>[REDACTED]</Credentials> <Pin>[REDACTED]</Pin>',
+            'Foo::token() at 12:30, Error: none' => 'Foo::token() at 12:30, Error: none',
+        ];
+        foreach ($cases as $in => $expected) {
+            $this->assertSame($expected, $this->redactor->redactString($in), $in);
+        }
+    }
+
+    public function testHeaderAndParameterNames(): void
+    {
+        foreach (['X-Api-Key', 'X-Session-Id', 'Cookie', 'X-Auth-Token', 'x-signature'] as $header) {
+            $this->assertTrue($this->redactor->isSecretHeader($header), $header);
+        }
+        $this->assertFalse($this->redactor->isSecretHeader('Accept'));
+        $this->assertTrue($this->redactor->isSecretName('code'));
+        $this->assertFalse($this->redactor->isSensitiveKey('code'), 'too generic for body keys');
+        $this->assertFalse($this->redactor->isSensitiveKey('sessionTimeout'));
     }
 
     public function testNonStringScalarsPassThrough(): void

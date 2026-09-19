@@ -3,13 +3,11 @@
 namespace DevZone\LogMonitor\Http\Middleware;
 
 use Closure;
-use DevZone\LogMonitor\Capture\BodyReader;
 use DevZone\LogMonitor\Capture\Execution;
 use DevZone\LogMonitor\Capture\Recorder;
 use DevZone\LogMonitor\Support\CurrentUser;
 use DevZone\LogMonitor\Support\Redactor;
 use DevZone\LogMonitor\Support\Report;
-use DevZone\LogMonitor\Support\Text;
 use Illuminate\Http\Request;
 use Symfony\Component\HttpFoundation\BinaryFileResponse;
 use Symfony\Component\HttpFoundation\Response;
@@ -100,9 +98,16 @@ class CaptureRequests
 
         $status = $response instanceof Response ? $response->getStatusCode() : null;
 
+        // The route template (/password/reset/{token}) rather than the real
+        // path, which can carry tokens; unmatched paths are scrubbed by the
+        // recorder.
+        $url = $routeUri !== null && $this->recorder->setting('requests.url', 'route') !== 'path'
+            ? $request->getSchemeAndHttpHost() . $routeUri
+            : $request->url();
+
         $info = [
             'method' => $request->getMethod(),
-            'url' => $request->url(),
+            'url' => $url,
             'route' => $routeUri,
             'route_name' => $routeName,
             'action' => $action,
@@ -140,7 +145,7 @@ class CaptureRequests
      */
     private function shouldCaptureBodies($request, ?int $status, Execution $execution): bool
     {
-        $onStatus = $this->recorder->setting('requests.bodies.on_status', 500);
+        $onStatus = $this->recorder->setting('requests.bodies.on_status');
         if ($onStatus !== null && $status !== null && $status >= (int) $onStatus) {
             return true;
         }
@@ -165,50 +170,25 @@ class CaptureRequests
 
     /**
      * @param Request $request
-     */
-    /**
      * @return array{text: string, redacted: bool, cut: ?string}|null
      */
     private function requestBody($request, int $max): ?array
     {
+        $only = (array) $this->recorder->setting('requests.bodies.only_fields', []);
         $files = $request->allFiles();
         $input = $files === [] ? $request->input() : $request->except(array_keys($files));
         if (is_array($input) && $input !== []) {
-            $clean = $this->redactor->redact($input);
-            $json = json_encode($clean, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR);
-            if (!is_string($json)) {
-                return null;
-            }
+            // Already parsed by Laravel (JSON or form): mask the structure.
             $note = $files !== [] ? count($files) . ' uploaded file(s) not kept' : null;
 
-            return $this->bounded($json, $max, $clean != $input, $note);
+            return $this->recorder->sanitizer()->structured($input, $max, $only, $note);
         }
         $raw = (string) $request->getContent();
         if ($raw === '') {
             return null;
         }
-        $read = Text::limitBytes($raw, $max * 4);
-        $clean = $this->redactor->redactBody($read);
 
-        return $this->bounded($clean, $max, Recorder::masked($read, $clean), null, strlen($raw));
-    }
-
-    /**
-     * @return array{text: string, redacted: bool, cut: ?string}
-     */
-    private function bounded(string $text, int $max, bool $redacted, ?string $note = null, ?int $fullSize = null): array
-    {
-        $kept = Text::limitBytes($text, $max);
-        $full = max($fullSize ?? 0, strlen($text));
-        $cut = strlen($kept) < $full ? 'kept ' . BodyReader::formatBytes(strlen($kept)) . ' of ' . BodyReader::formatBytes($full) : null;
-        if ($cut !== null) {
-            $kept .= "\n…[cut: {$cut}]";
-        }
-        if ($note !== null) {
-            $cut = $cut !== null ? "{$cut}; {$note}" : $note;
-        }
-
-        return ['text' => $kept, 'redacted' => $redacted, 'cut' => $cut];
+        return $this->recorder->sanitizer()->sanitize($raw, (string) $request->headers->get('Content-Type', ''), $max, null, $only);
     }
 
     /**
@@ -220,18 +200,13 @@ class CaptureRequests
         if (!$response instanceof Response || $response instanceof BinaryFileResponse || $response instanceof StreamedResponse) {
             return null;
         }
-        $type = (string) $response->headers->get('Content-Type', '');
-        if ($type !== '' && !preg_match('#json|text|xml|html|javascript#i', $type)) {
-            return null;
-        }
         $content = $response->getContent();
         if (!is_string($content) || $content === '') {
             return null;
         }
-        $read = Text::limitBytes($content, $max * 4);
-        $clean = $this->redactor->redactBody($read);
+        $only = (array) $this->recorder->setting('requests.bodies.only_fields', []);
 
-        return $this->bounded($clean, $max, Recorder::masked($read, $clean), null, strlen($content));
+        return $this->recorder->sanitizer()->sanitize($content, (string) $response->headers->get('Content-Type', ''), $max, null, $only);
     }
 
     /**

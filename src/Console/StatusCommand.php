@@ -30,18 +30,20 @@ class StatusCommand extends Command
             $batchBytes += (int) @filesize($batch);
         }
         $oldest = $batches !== [] ? basename($batches[0]) : '-';
+        $failed = $directory->failedSummary();
 
         $rows = [
             ['Enabled (LOG_MONITOR_ENABLED)', empty($config['enabled']) ? 'no' : 'yes'],
             ['Switched off (log-monitor:off)', KillSwitch::isOn((string) ($config['kill_switch_path'] ?? '')) ? 'yes' : 'no'],
             ['Capturing now', LogMonitorServiceProvider::active($config) ? 'yes' : 'no'],
+            ['Package version', LogMonitorServiceProvider::version()],
             ['Endpoint host', (string) ($transport->host() ?? '-')],
             ['Endpoint accepted', $transport->isConfigured() ? ($transport->endpointAllowed() ? 'yes' : 'no (https required)') : 'not configured'],
             ['Spool folder', $directory->path()],
             ['current.ndjson', is_file($current) ? self::bytes((int) @filesize($current)) : 'empty'],
             ['Batches waiting', count($batches) . ' (' . self::bytes($batchBytes) . ')'],
             ['Oldest waiting', $oldest],
-            ['Quarantined (failed/)', (string) count($directory->failedBatches())],
+            ['Quarantined (failed/)', $failed['count'] . ' (' . self::bytes($failed['bytes']) . ')' . ($failed['oldest'] !== null ? ', oldest ' . $failed['oldest'] : '')],
         ];
 
         $last = $directory->lastRun();

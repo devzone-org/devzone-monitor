@@ -65,11 +65,32 @@ final class BodyReaderTest extends TestCase
         $this->assertNull(BodyReader::read(null, 100));
     }
 
+    public function testThePositionIsRestoredEvenWhenReadingFails(): void
+    {
+        $inner = Utils::streamFor('hello world');
+        $inner->seek(3);
+        $stream = new class($inner) implements \Psr\Http\Message\StreamInterface {
+            use \GuzzleHttp\Psr7\StreamDecoratorTrait;
+
+            /** @var \Psr\Http\Message\StreamInterface */
+            private $stream;
+
+            public function read($length): string
+            {
+                throw new \RuntimeException('disk gone');
+            }
+        };
+        $response = new PsrResponse(200, ['Content-Type' => 'application/json'], $stream);
+
+        $this->assertNull(BodyReader::read($response, 100));
+        $this->assertSame(3, $inner->tell());
+    }
+
     public function testRequestBodiesAreReadToo(): void
     {
         $request = new Request(new PsrRequest('POST', 'https://api.example/verify', ['Content-Type' => 'application/json'], '{"iban":"PK00"}'));
 
-        $this->assertSame(['body' => '{"iban":"PK00"}', 'size' => 15], BodyReader::read($request, 100));
+        $this->assertSame(['body' => '{"iban":"PK00"}', 'size' => 15, 'type' => 'application/json'], BodyReader::read($request, 100));
         $this->assertSame('{"iban":"PK00"}', $request->body());
     }
 }

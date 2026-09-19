@@ -96,7 +96,7 @@ class EventHooks
                     return;
                 }
             }
-            $this->recorder->recordQuery((string) $event->sql, (float) $event->time, (string) ($event->connectionName ?? ''));
+            $this->recorder->recordQuery((string) $event->sql, (float) $event->time, (string) ($event->connectionName ?? ''), $this->driver($event));
         } catch (\Throwable $e) {
             Report::error('query listener failed', $e);
         }
@@ -151,12 +151,12 @@ class EventHooks
                 'request_bytes' => isset($stats['size_upload']) ? (int) $stats['size_upload'] : null,
                 'response_bytes' => isset($stats['size_download']) ? (int) $stats['size_download'] : $this->headerLength($response),
             ];
-            if ($this->recorder->setting('outgoing.headers', true)) {
+            if ($this->recorder->setting('outgoing.headers', false)) {
                 $call['request_headers'] = method_exists($request, 'headers') ? (array) $request->headers() : [];
                 $call['response_headers'] = method_exists($response, 'headers') ? (array) $response->headers() : [];
             }
-            if ($this->recorder->keepsOutgoingBodies($failed)) {
-                // Read only when kept, and only the first few KB: see BodyReader.
+            if ($this->recorder->keepsOutgoingBodies($failed, $this->host($request))) {
+                // Read only when kept, and only up to the parse limit: see BodyReader.
                 $call += $this->bodies(['request' => $request, 'response' => $response]);
             }
             $this->recorder->recordOutgoing($call);
@@ -179,35 +179,55 @@ class EventHooks
                 'status' => null,
                 'ms' => $start !== null ? (microtime(true) - $start) * 1000 : null,
                 'error' => 'connection failed',
-                'request_headers' => $this->recorder->setting('outgoing.headers', true) && method_exists($request, 'headers')
+                'request_headers' => $this->recorder->setting('outgoing.headers', false) && method_exists($request, 'headers')
                     ? (array) $request->headers()
                     : null,
-            ] + ($this->recorder->keepsOutgoingBodies(true) ? $this->bodies(['request' => $request]) : []));
+            ] + ($this->recorder->keepsOutgoingBodies(true, $this->host($request)) ? $this->bodies(['request' => $request]) : []));
         } catch (\Throwable $e) {
             Report::error('outgoing listener failed', $e);
         }
     }
 
     /**
-     * request_body / response_body (+ _size) for the messages given, read
-     * with a cap well under memory: redaction headroom of 4x what is kept.
+     * request_body / response_body (+ _size, _type) for the messages given,
+     * read up to one byte past the parse limit: a body larger than that is
+     * not kept at all, so there is no point reading more.
      *
      * @param array<string, mixed> $messages
      * @return array<string, mixed>
      */
     private function bodies(array $messages): array
     {
-        $limit = 4 * max(256, (int) $this->recorder->setting('outgoing.max_bytes', 8192));
+        $limit = $this->recorder->sanitizer()->readLimit();
         $out = [];
         foreach ($messages as $side => $message) {
             $read = BodyReader::read($message, $limit);
             if ($read !== null) {
                 $out[$side . '_body'] = $read['body'];
                 $out[$side . '_body_size'] = $read['size'];
+                $out[$side . '_body_type'] = $read['type'] ?? null;
             }
         }
 
         return $out;
+    }
+
+    private function host($request): ?string
+    {
+        $host = parse_url((string) $request->url(), PHP_URL_HOST);
+
+        return is_string($host) ? $host : null;
+    }
+
+    private function driver($event): string
+    {
+        try {
+            $connection = $event->connection ?? null;
+
+            return is_object($connection) && method_exists($connection, 'getDriverName') ? (string) $connection->getDriverName() : '';
+        } catch (\Throwable $e) {
+            return '';
+        }
     }
 
     public function onJobProcessing($event): void

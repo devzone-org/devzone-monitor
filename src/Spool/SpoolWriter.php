@@ -50,7 +50,12 @@ class SpoolWriter implements RecordSink
     public static function fromConfig(array $spool): self
     {
         return new self(
-            new SpoolDirectory((string) ($spool['path'] ?? sys_get_temp_dir() . '/log-monitor-spool')),
+            new SpoolDirectory(
+                (string) ($spool['path'] ?? sys_get_temp_dir() . '/log-monitor-spool'),
+                SpoolDirectory::parseMode($spool['file_mode'] ?? null, SpoolDirectory::DEFAULT_FILE_MODE),
+                SpoolDirectory::parseMode($spool['dir_mode'] ?? null, SpoolDirectory::DEFAULT_DIR_MODE),
+                isset($spool['group']) && is_string($spool['group']) ? $spool['group'] : null
+            ),
             (int) ($spool['rotate_bytes'] ?? 5 * 1024 * 1024),
             (int) ($spool['min_free_disk'] ?? 500 * 1024 * 1024),
             (int) ($spool['max_total_bytes'] ?? 200 * 1024 * 1024),
@@ -91,6 +96,11 @@ class SpoolWriter implements RecordSink
 
             for ($attempt = 0; $attempt < self::ATTEMPTS; $attempt++) {
                 $result = $this->appendOnce($current, $data);
+                if ($result === false) {
+                    Report::error('spool file stayed locked, records dropped');
+
+                    return;
+                }
                 if ($result !== null) {
                     if ($result !== '') {
                         // This write rotated the file; enforce the caps now in
@@ -108,20 +118,21 @@ class SpoolWriter implements RecordSink
     }
 
     /**
-     * @return string|null null to retry, '' when written, the batch path when written and rotated
+     * @return string|false|null null to retry, false when the lock could not
+     *         be had in time, '' when written, the batch path when written
+     *         and rotated
      */
-    private function appendOnce(string $current, string $data): ?string
+    private function appendOnce(string $current, string $data)
     {
-        $old = umask(0002);
-        $handle = @fopen($current, 'ab');
-        umask($old);
+        $handle = $this->directory->open($current, 'ab');
         if ($handle === false) {
             return null;
         }
 
         try {
-            if (!@flock($handle, LOCK_EX)) {
-                return null;
+            // A request never waits on the spool for more than a moment.
+            if (!SpoolDirectory::lockWithin($handle, SpoolDirectory::WRITE_LOCK_SECONDS)) {
+                return false;
             }
             if (!SpoolDirectory::handleMatchesPath($handle, $current)) {
                 return null; // rotated between fopen and flock: reopen
@@ -129,6 +140,9 @@ class SpoolWriter implements RecordSink
 
             $before = @fstat($handle);
             $startSize = $before !== false ? (int) $before['size'] : null;
+            if ($before !== false && ((int) $before['mode'] & 0777) !== $this->directory->fileMode()) {
+                $this->directory->protect($current); // created by an older version, or before a mode change
+            }
 
             $length = strlen($data);
             $written = 0;

@@ -86,13 +86,27 @@ ENV;
             }
         }
 
+        $unsafe = [];
+        if (config('log-monitor.requests.bodies.on_status') !== null) {
+            $unsafe[] = 'requests.bodies.on_status';
+        }
+        if (in_array(config('log-monitor.outgoing.bodies'), ['errors', 'always'], true)) {
+            $unsafe[] = 'outgoing.bodies';
+        }
+        if (config('log-monitor.outgoing.headers')) {
+            $unsafe[] = 'outgoing.headers';
+        }
+        if ($unsafe !== []) {
+            $warnings[] = 'Body or header capture is on (' . implode(', ', $unsafe) . '). Since 2.1 these are off by default; a config published before 2.1 keeps the old values. Leave them on only where you need them.';
+        }
+
         if (function_exists('posix_geteuid') && function_exists('posix_getpwuid')) {
             $spool = (string) config('log-monitor.spool.path', '');
             if ($spool !== '' && is_dir($spool) && @fileowner($spool) !== posix_geteuid()) {
                 $owner = @posix_getpwuid((int) @fileowner($spool));
                 $me = @posix_getpwuid(posix_geteuid());
                 $warnings[] = sprintf(
-                    'The spool folder is owned by "%s" but this command runs as "%s". PHP-FPM and the scheduler must be able to write, rename and delete files there (same user or a shared group).',
+                    'The spool folder is owned by "%s" but this command runs as "%s". PHP-FPM and the scheduler must be able to write, rename and delete files there: run both as one user, or share a group and set LOG_MONITOR_SPOOL_FILE_MODE=0660, LOG_MONITOR_SPOOL_DIR_MODE=0770 and LOG_MONITOR_SPOOL_GROUP.',
                     is_array($owner) ? $owner['name'] : '?',
                     is_array($me) ? $me['name'] : '?'
                 );

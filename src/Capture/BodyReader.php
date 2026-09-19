@@ -28,9 +28,10 @@ final class BodyReader
     ];
 
     /**
-     * @return array{body: string, size: ?int}|null body = text read (at most
-     *         $limit bytes) or a bracketed note; size = full body size when
-     *         known. Null when there is no body.
+     * @return array{body: string, size: ?int, type: string}|null body = text
+     *         read (at most $limit bytes) or a bracketed note; size = full
+     *         body size when known; type = Content-Type. Null when there is
+     *         no body.
      */
     public static function read($message, int $limit): ?array
     {
@@ -46,35 +47,45 @@ final class BodyReader
                 return null;
             }
 
-            $type = strtolower(trim(explode(';', $psr->getHeaderLine('Content-Type'))[0]));
+            $contentType = $psr->getHeaderLine('Content-Type');
+            $type = strtolower(trim(explode(';', $contentType)[0]));
             if ($type !== '' && self::isBinaryType($type)) {
-                return ['body' => self::note("{$type} body not kept", $size), 'size' => $size];
+                return ['body' => self::note("{$type} body not kept", $size), 'size' => $size, 'type' => $contentType];
             }
 
             if (!$stream->isSeekable() || !$stream->isReadable()) {
-                return ['body' => self::note('streamed body not kept', $size), 'size' => $size];
+                return ['body' => self::note('streamed body not kept', $size), 'size' => $size, 'type' => $contentType];
             }
 
             $position = $stream->tell();
-            $stream->rewind();
             $data = '';
-            while (strlen($data) < $limit && !$stream->eof()) {
-                $chunk = $stream->read($limit - strlen($data));
-                if ($chunk === '') {
-                    break;
+            try {
+                $stream->rewind();
+                while (strlen($data) < $limit && !$stream->eof()) {
+                    $chunk = $stream->read($limit - strlen($data));
+                    if ($chunk === '') {
+                        break;
+                    }
+                    $data .= $chunk;
                 }
-                $data .= $chunk;
+            } finally {
+                // Put the stream back even when reading failed half way, so
+                // the application reads the body as if it was never touched.
+                try {
+                    $stream->seek($position);
+                } catch (\Throwable $e) {
+                    // Nothing more can be done; the read error is reported below.
+                }
             }
-            $stream->seek($position);
 
             if ($data === '') {
                 return null;
             }
             if (strpos($data, "\0") !== false) {
-                return ['body' => self::note('binary body not kept', $size), 'size' => $size];
+                return ['body' => self::note('binary body not kept', $size), 'size' => $size, 'type' => $contentType];
             }
 
-            return ['body' => $data, 'size' => $size];
+            return ['body' => $data, 'size' => $size, 'type' => $contentType];
         } catch (\Throwable $e) {
             return null;
         }

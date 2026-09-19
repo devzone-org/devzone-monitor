@@ -39,14 +39,21 @@ final class Execution
     public $exceptionCount = 0;
 
     /** @var array<string, int> Records not kept because a cap was reached. */
-    public $dropped = ['queries' => 0, 'slow_queries' => 0, 'outgoing' => 0, 'logs' => 0, 'exceptions' => 0];
+    public $dropped = ['queries' => 0, 'slow_queries' => 0, 'outgoing' => 0, 'logs' => 0, 'exceptions' => 0, 'statements' => 0, 'memory' => 0];
 
     /**
-     * Per distinct statement: [connection, sql, count, total_ms, location|null].
+     * Per distinct statement: [connection, sql, count, total_ms, location|null, driver].
+     * sql is null when the statement is too long to be parsed.
      *
-     * @var array<string, array{0: string, 1: string, 2: int, 3: float, 4: array|null}>
+     * @var array<string, array{0: string, 1: ?string, 2: int, 3: float, 4: array|null, 5: string}>
      */
     public $statements = [];
+
+    /** @var int Bytes of raw SQL held in $statements. */
+    public $statementBytes = 0;
+
+    /** @var int Bytes of encoded records held in the buffers below. */
+    public $bufferedBytes = 0;
 
     /** @var array<int, array{0: string, 1: float, 2: array|null}> [statement key, ms, location] */
     public $queries = [];
@@ -54,13 +61,13 @@ final class Execution
     /** @var array<int, array<string, mixed>> */
     public $slowQueries = [];
 
-    /** @var array<int, array<string, mixed>> Built records waiting to be written. */
+    /** @var array<int, string> Encoded records waiting to be written. */
     public $outgoing = [];
 
-    /** @var array<int, array<string, mixed>> */
+    /** @var array<int, string> */
     public $logs = [];
 
-    /** @var array<int, array<string, mixed>> */
+    /** @var array<int, string> */
     public $exceptions = [];
 
     /** @var array<int, bool> spl_object_id of exceptions already recorded */

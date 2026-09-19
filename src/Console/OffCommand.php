@@ -9,7 +9,7 @@ use Illuminate\Console\Command;
 class OffCommand extends Command
 {
     /** @var string */
-    protected $signature = 'log-monitor:off {--purge : Also delete everything waiting in the spool}';
+    protected $signature = 'log-monitor:off {--purge : Also delete everything waiting in the spool, quarantined batches included}';
 
     /** @var string */
     protected $description = 'Emergency stop: switch capture and shipping off without changing .env';
@@ -22,18 +22,11 @@ class OffCommand extends Command
 
             return 1;
         }
-        $this->info('log-monitor switched off. Capture stops with the next request; run log-monitor:on to resume.');
+        $this->info('log-monitor switched off. Web requests stop capturing at once; running queue workers within a few seconds, after the job in hand. Run log-monitor:on to resume.');
 
         if ($this->option('purge')) {
-            $directory = $this->laravel->make(SpoolWriter::class)->directory();
-            $removed = 0;
-            foreach (array_merge($directory->batches(), [$directory->currentPath()]) as $file) {
-                if (is_file($file)) {
-                    $directory->delete($file);
-                    $removed++;
-                }
-            }
-            $this->line(sprintf('Deleted %d spool file(s).', $removed));
+            $removed = $this->laravel->make(SpoolWriter::class)->directory()->purge();
+            $this->line(sprintf('Deleted %d spool file(s), including quarantined batches.', $removed));
         }
 
         return 0;

@@ -68,6 +68,7 @@ class Shipper
         ];
 
         if (!$dryRun) {
+            $this->directory->tighten();
             $this->directory->rotateCurrent();
             $summary['dropped_batches'] = $this->directory->prune(
                 (int) ($spool['max_total_bytes'] ?? 200 * 1024 * 1024),
@@ -99,6 +100,13 @@ class Shipper
 
             $complete = true;
             foreach (self::chunks($remaining, $perRequest, $maxBytes) as $chunk) {
+                // Checked before every request, not only between batches, so
+                // a big batch on a slow server cannot run past the budget by
+                // more than one request.
+                if ($budget > 0 && $this->now() - $started >= $budget) {
+                    $summary['stopped'] = 'time budget reached';
+                    break 2;
+                }
                 $result = $this->transport->send($this->body($chunk));
                 $summary['requests']++;
 

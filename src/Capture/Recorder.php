@@ -2,6 +2,7 @@
 
 namespace DevZone\LogMonitor\Capture;
 
+use DevZone\LogMonitor\Support\BodySanitizer;
 use DevZone\LogMonitor\Support\Fingerprint;
 use DevZone\LogMonitor\Support\Levels;
 use DevZone\LogMonitor\Support\Redactor;
@@ -24,6 +25,11 @@ class Recorder
     const MAX_PREVIOUS = 3;
     const CONTEXT_MAX_DEPTH = 6;
     const CONTEXT_MAX_ITEMS = 100;
+    const CONTEXT_MAX_VALUES = 1000;
+    const SWITCH_CHECK_SECONDS = 5.0;
+    const NORMALIZED_CACHE_BYTES = 2097152;
+    const SQL_NOT_CAPTURED = '[sql not captured]';
+    const MESSAGE_NOT_CAPTURED = '[message not captured]';
 
     /** @var array<string, mixed> */
     private $config;
@@ -49,8 +55,26 @@ class Recorder
     /** @var bool */
     private $shutdownRegistered = false;
 
-    /** @var array<string, array{0: string, 1: string}> statement key => [hash, normalized sql] */
+    /** @var array<string, array{0: string, 1: string, 2: string}> statement key => [hash, normalized sql, connection] */
     private $normalized = [];
+
+    /** @var int Bytes of SQL held in $normalized. */
+    private $normalizedBytes = 0;
+
+    /** @var BodySanitizer */
+    private $sanitizer;
+
+    /** @var callable(): bool|null Whether log-monitor:off is in force. */
+    private $switchedOff;
+
+    /** @var float|null */
+    private $switchCheckedAt = null;
+
+    /** @var bool */
+    private $off = false;
+
+    /** @var int Values left for the log context being normalised. */
+    private $contextBudget = 0;
 
     public function __construct(
         array $config,
@@ -58,12 +82,16 @@ class Recorder
         Redactor $redactor,
         Location $location,
         ?callable $clock = null,
-        ?callable $random = null
+        ?callable $random = null,
+        ?callable $switchedOff = null
     ) {
         $this->config = $config;
         $this->sink = $sink;
         $this->redactor = $redactor;
         $this->location = $location;
+        $this->switchedOff = $switchedOff;
+        $redact = isset($config['redact']) && is_array($config['redact']) ? $config['redact'] : [];
+        $this->sanitizer = BodySanitizer::fromConfig($redactor, $redact);
         $this->clock = $clock ?: function () {
             return microtime(true);
         };
@@ -82,6 +110,9 @@ class Recorder
             // A request starts a fresh stack: anything left from a previous
             // request in a long-running process is abandoned.
             $this->stack = [];
+            if ($this->isSwitchedOff()) {
+                return null;
+            }
             $execution = $this->newExecution('request', null, $this->config);
             $this->stack[] = $execution;
 
@@ -133,7 +164,7 @@ class Recorder
                     'ms' => $this->elapsedMs($execution),
                     'bootstrap_ms' => $info['bootstrap_ms'] ?? null,
                     'method' => $info['method'] ?? null,
-                    'url' => isset($info['url']) ? $this->stripQuery((string) $info['url']) : null,
+                    'url' => isset($info['url']) ? $this->redactor->redactUrl($this->stripQuery((string) $info['url'])) : null,
                     'route' => $info['route'] ?? null,
                     'route_name' => $info['route_name'] ?? null,
                     'action' => $info['action'] ?? null,
@@ -170,7 +201,7 @@ class Recorder
     public function startJob(array $meta, ?string $parent): ?Execution
     {
         try {
-            if (!$this->setting('jobs.enabled', true)) {
+            if (!$this->setting('jobs.enabled', true) || $this->isSwitchedOff()) {
                 return null;
             }
             $class = isset($meta['class']) ? (string) $meta['class'] : '';
@@ -238,7 +269,7 @@ class Recorder
             ] + $this->totals($execution);
 
             if ($exception !== null) {
-                [$message, $redacted, $cut] = $this->cleanText((string) $exception->getMessage(), 1000);
+                [$message, $redacted, $cut] = $this->exceptionMessage($exception, 1000);
                 $record['exception'] = ['class' => get_class($exception), 'message' => $message];
                 self::mark($record, 'exception.message', $redacted, $cut);
             }
@@ -277,7 +308,7 @@ class Recorder
                 'status' => 'failed',
             ];
             if ($exception !== null) {
-                [$message, $redacted, $cut] = $this->cleanText((string) $exception->getMessage(), 1000);
+                [$message, $redacted, $cut] = $this->exceptionMessage($exception, 1000);
                 $record['exception'] = ['class' => get_class($exception), 'message' => $message];
                 self::mark($record, 'exception.message', $redacted, $cut);
             }
@@ -311,9 +342,15 @@ class Recorder
         try {
             $fatal = self::fatalError();
             for ($i = count($this->stack) - 1; $i >= 0; $i--) {
+                if (!isset($this->stack[$i])) {
+                    continue; // switched off meanwhile: the stack was dropped
+                }
                 $execution = $this->stack[$i];
                 if ($fatal !== null && $i === count($this->stack) - 1) {
-                    $execution->exceptions[] = $this->fatalRecord($execution, $fatal);
+                    $line = $this->encode($this->fatalRecord($execution, $fatal));
+                    if ($line !== null) {
+                        $execution->exceptions[] = $line;
+                    }
                     $execution->exceptionCount++;
                 }
                 if ($execution->kind === 'request') {
@@ -331,7 +368,7 @@ class Recorder
     // Capture
     // ------------------------------------------------------------------
 
-    public function recordQuery(string $sql, float $ms, string $connection): void
+    public function recordQuery(string $sql, float $ms, string $connection, string $driver = ''): void
     {
         try {
             $execution = $this->current();
@@ -342,9 +379,20 @@ class Recorder
             $execution->queryCount++;
             $execution->queryMs += $ms;
 
-            $key = $connection . "\0" . $sql;
+            // Long statements are keyed by their hash so the key itself stays small.
+            $key = $connection . "\0" . (strlen($sql) > 512 ? 'md5:' . md5($sql) : $sql);
             if (!isset($execution->statements[$key])) {
-                $execution->statements[$key] = [$connection, $sql, 0, 0.0, null];
+                // Memory caps: beyond them a new statement is only counted.
+                $keep = strlen($sql) <= SqlNormalizer::MAX_INPUT ? $sql : null;
+                $bytes = strlen((string) $keep) + strlen($key);
+                if (count($execution->statements) >= (int) $execution->setting('queries.max_statements', 1000)
+                    || $execution->statementBytes + $bytes > (int) $execution->setting('queries.max_statement_bytes', 2097152)) {
+                    $execution->dropped['statements']++;
+
+                    return;
+                }
+                $execution->statements[$key] = [$connection, $keep, 0, 0.0, null, $driver];
+                $execution->statementBytes += $bytes;
             }
             $execution->statements[$key][2]++;
             $execution->statements[$key][3] += $ms;
@@ -418,6 +466,7 @@ class Recorder
             $status = isset($call['status']) ? (int) $call['status'] : null;
             $failed = $status === null || $status >= 400 || !empty($call['error']);
             $parts = parse_url((string) ($call['url'] ?? '')) ?: [];
+            $host = isset($parts['host']) ? (string) $parts['host'] : null;
 
             $record = [
                 't' => 'outgoing',
@@ -428,7 +477,7 @@ class Recorder
                 'scheme' => $parts['scheme'] ?? null,
                 'host' => $parts['host'] ?? null,
                 'port' => $parts['port'] ?? null,
-                'path' => $parts['path'] ?? '/',
+                'path' => $this->redactor->redactPath((string) ($parts['path'] ?? '/')),
                 'status' => $status,
                 'ms' => $ms !== null ? round($ms, 2) : null,
                 'request_bytes' => $call['request_bytes'] ?? null,
@@ -445,7 +494,7 @@ class Recorder
                     self::mark($record, 'query', $meta['redacted'], $meta['cut']);
                 }
             }
-            if ($execution->setting('outgoing.headers', true)) {
+            if ($execution->setting('outgoing.headers', false)) {
                 foreach (['request_headers', 'response_headers'] as $key) {
                     if (isset($call[$key]) && is_array($call[$key]) && $call[$key] !== []) {
                         $record[$key] = $this->headers($call[$key], $meta);
@@ -453,12 +502,14 @@ class Recorder
                     }
                 }
             }
-            if ($this->keepsOutgoingBodies($failed)) {
+            if ($this->keepsOutgoingBodies($failed, $host)) {
                 $max = (int) $execution->setting('outgoing.max_bytes', 8192);
+                $only = (array) $execution->setting('outgoing.only_fields', []);
                 foreach (['request_body', 'response_body'] as $key) {
                     if (isset($call[$key]) && is_string($call[$key]) && $call[$key] !== '') {
                         $size = isset($call[$key . '_size']) && is_int($call[$key . '_size']) ? $call[$key . '_size'] : null;
-                        $record[$key] = $this->outgoingBody($call[$key], $max, $size, $meta);
+                        $type = isset($call[$key . '_type']) && is_string($call[$key . '_type']) ? $call[$key . '_type'] : null;
+                        $record[$key] = $this->outgoingBody($call[$key], $type, $max, $size, $only, $meta);
                         self::mark($record, $key, $meta['redacted'], $meta['cut']);
                     }
                 }
@@ -467,9 +518,7 @@ class Recorder
                 $execution->errored = true;
             }
 
-            $execution->outgoing[] = $record;
-            $execution->pending++;
-            $this->maybeFlush($execution);
+            $this->buffer($execution, 'outgoing', $record);
         } catch (\Throwable $e) {
             Report::error('could not record outgoing call', $e);
         }
@@ -502,10 +551,7 @@ class Recorder
                 return;
             }
 
-            $raw = $this->stringify($message);
-            $text = $this->redactor->redactString($raw);
-            $normalizedContext = $this->normalizeContext($context);
-            $redactedContext = $this->redactor->redact($normalizedContext);
+            [$text, $redacted, $cut] = $this->cleanText($this->stringify($message), self::MESSAGE_MAX);
             $record = [
                 't' => 'log',
                 'v' => self::RECORD_VERSION,
@@ -513,12 +559,18 @@ class Recorder
                 'at' => $this->iso($this->now()),
                 'level' => strtolower($level),
                 'severity' => Levels::severity($level),
-                'message' => Text::limit($text, self::MESSAGE_MAX),
-                'context' => $redactedContext,
+                'message' => $text,
+                'context' => [],
                 'fingerprint' => Fingerprint::log($level, $text),
             ];
-            self::mark($record, 'message', $text !== $raw, self::cutNote($text, self::MESSAGE_MAX));
-            self::mark($record, 'context', $redactedContext !== $normalizedContext);
+            self::mark($record, 'message', $redacted, $cut);
+            if ($this->setting('logs.context', true)) {
+                $normalizedContext = $this->normalizeContext($context);
+                $record['context'] = $this->redactor->redact($normalizedContext);
+                self::mark($record, 'context', $record['context'] !== $normalizedContext);
+            } elseif ($context !== []) {
+                self::mark($record, 'context', false, 'not captured (logs.context is off)');
+            }
 
             if ($execution === null) {
                 $this->write([$this->encode($record)]);
@@ -535,9 +587,7 @@ class Recorder
 
                 return;
             }
-            $execution->logs[] = $record;
-            $execution->pending++;
-            $this->maybeFlush($execution);
+            $this->buffer($execution, 'logs', $record);
         } catch (\Throwable $e) {
             Report::error('could not record log', $e);
         }
@@ -582,9 +632,7 @@ class Recorder
 
             return;
         }
-        $execution->exceptions[] = $this->exceptionRecord($execution, $exception);
-        $execution->pending++;
-        $this->maybeFlush($execution);
+        $this->buffer($execution, 'exceptions', $this->exceptionRecord($execution, $exception));
     }
 
     /**
@@ -611,22 +659,21 @@ class Recorder
         while ($cause !== null && count($previous) < self::MAX_PREVIOUS) {
             $previous[] = [
                 'class' => get_class($cause),
-                'message' => Text::limit($this->redactor->redactString((string) $cause->getMessage()), 1000),
+                'message' => $this->exceptionMessage($cause, 1000)[0],
                 'file' => $this->location->relative((string) $cause->getFile()),
                 'line' => (int) $cause->getLine(),
             ];
             $cause = $cause->getPrevious();
         }
 
-        $raw = (string) $exception->getMessage();
-        $message = $this->redactor->redactString($raw);
+        [$message, $redacted, $cut] = $this->exceptionMessage($exception, self::MESSAGE_MAX);
         $record = [
             't' => 'exception',
             'v' => self::RECORD_VERSION,
             'trace' => $execution !== null ? $execution->trace : null,
             'at' => $this->iso($this->now()),
             'class' => get_class($exception),
-            'message' => Text::limit($message, self::MESSAGE_MAX),
+            'message' => $message,
             'code' => (string) $exception->getCode(),
             'file' => $file,
             'line' => $line,
@@ -634,7 +681,7 @@ class Recorder
             'previous' => $previous,
             'fingerprint' => Fingerprint::exception(get_class($exception), $file, $line),
         ];
-        self::mark($record, 'message', $message !== $raw, self::cutNote($message, self::MESSAGE_MAX));
+        self::mark($record, 'message', $redacted, $cut);
 
         return $record;
     }
@@ -653,7 +700,9 @@ class Recorder
             'trace' => $execution->trace,
             'at' => $this->iso($this->now()),
             'class' => 'FatalError',
-            'message' => Text::limit($this->redactor->redactString((string) $error['message']), self::MESSAGE_MAX),
+            'message' => $this->setting('exceptions.messages', true)
+                ? $this->cleanText((string) $error['message'], self::MESSAGE_MAX)[0]
+                : self::MESSAGE_NOT_CAPTURED,
             'code' => (string) $error['type'],
             'file' => $file,
             'line' => (int) $error['line'],
@@ -728,8 +777,8 @@ class Recorder
         }
 
         foreach (['outgoing', 'logs', 'exceptions'] as $bucket) {
-            foreach ($execution->{$bucket} as $record) {
-                $lines[] = $this->encode($record);
+            foreach ($execution->{$bucket} as $line) {
+                $lines[] = $line;
             }
         }
 
@@ -802,18 +851,17 @@ class Recorder
     private function statement(Execution $execution, string $key): array
     {
         if (!isset($this->normalized[$key])) {
-            if (count($this->normalized) >= 5000) {
+            if (count($this->normalized) >= 2000 || $this->normalizedBytes > self::NORMALIZED_CACHE_BYTES) {
                 $this->normalized = [];
+                $this->normalizedBytes = 0;
             }
             $statement = $execution->statements[$key] ?? null;
             $connection = $statement !== null ? $statement[0] : '';
             $raw = $statement !== null ? $statement[1] : '';
-            $normalized = SqlNormalizer::normalize($raw);
-            $this->normalized[$key] = [
-                SqlNormalizer::hash($connection, $normalized),
-                $this->redactor->redactPatterns($normalized),
-                $connection,
-            ];
+            $normalized = $raw === null ? SqlNormalizer::TOO_LONG : SqlNormalizer::normalize($raw, $statement !== null ? (string) $statement[5] : '');
+            $sql = $execution->setting('queries.capture_sql', true) ? $this->redactor->redactPatterns($normalized) : self::SQL_NOT_CAPTURED;
+            $this->normalized[$key] = [SqlNormalizer::hash($connection, $normalized), $sql, $connection];
+            $this->normalizedBytes += strlen($sql) + strlen($key);
         }
 
         return $this->normalized[$key];
@@ -845,14 +893,43 @@ class Recorder
     // Partial flushes (long jobs)
     // ------------------------------------------------------------------
 
-    private function maybeFlush(Execution $execution): void
+    /**
+     * Encode a record into one of the execution's buffers, within the
+     * memory budget: a request that reaches it keeps its totals but no more
+     * records; a job writes what it has and carries on.
+     *
+     * @param array<string, mixed> $record
+     */
+    private function buffer(Execution $execution, string $bucket, array $record): void
+    {
+        $line = $this->encode($record);
+        if ($line === null) {
+            return;
+        }
+        $budget = (int) $execution->setting('memory.max_buffer_bytes', 4194304);
+        if ($budget > 0 && $execution->bufferedBytes + strlen($line) > $budget) {
+            if ($execution->kind !== 'job') {
+                $execution->dropped['memory']++;
+
+                return;
+            }
+            $this->maybeFlush($execution, true);
+        }
+        $execution->{$bucket}[] = $line;
+        $execution->bufferedBytes += strlen($line);
+        $execution->pending++;
+        $this->maybeFlush($execution);
+    }
+
+    private function maybeFlush(Execution $execution, bool $force = false): void
     {
         if ($execution->kind !== 'job' || $execution->pending === 0) {
             return;
         }
         $records = (int) $execution->setting('jobs.flush_records', 500);
         $seconds = (float) $execution->setting('jobs.flush_seconds', 30);
-        $due = ($records > 0 && $execution->pending >= $records)
+        $due = $force
+            || ($records > 0 && $execution->pending >= $records)
             || ($seconds > 0 && $this->now() - $execution->lastFlushAt >= $seconds);
         if (!$due) {
             return;
@@ -871,6 +948,7 @@ class Recorder
         $execution->outgoing = [];
         $execution->logs = [];
         $execution->exceptions = [];
+        $execution->bufferedBytes = 0;
         $execution->pending = 0;
         $execution->lastFlushAt = $this->now();
         $execution->flushes++;
@@ -916,6 +994,13 @@ class Recorder
      */
     private function write(array $lines): void
     {
+        if ($this->isSwitchedOff()) {
+            // Switched off while this execution ran: drop it and anything
+            // else still open, write nothing.
+            $this->stack = [];
+
+            return;
+        }
         $lines = array_values(array_filter($lines, 'is_string'));
         if ($lines !== []) {
             $this->sink->write($lines);
@@ -1035,16 +1120,70 @@ class Recorder
     }
 
     /**
-     * Text cut to $maxChars, then redacted.
+     * Text redacted, then cut to $maxChars. Only a bounded head of a very
+     * long text is redacted; its last characters are dropped with the cut,
+     * so a secret split by the first cut can never be what is kept.
      *
      * @return array{0: string, 1: bool, 2: ?string} [text, was anything masked, cut note]
      */
     private function cleanText(string $raw, int $maxChars): array
     {
-        $limited = Text::limit($raw, $maxChars);
-        $clean = $this->redactor->redactString($limited);
+        $cut = self::cutNote($raw, $maxChars);
+        if ($cut === null) {
+            $clean = $this->redactor->redactString($raw);
 
-        return [$clean, $clean !== $limited, self::cutNote($raw, $maxChars)];
+            return [$clean, $clean !== $raw, null];
+        }
+
+        $margin = 256;
+        $head = Text::limit($raw, $maxChars + $margin);
+        $clean = $this->redactor->redactString($head);
+        $length = function_exists('mb_strlen') ? mb_strlen($clean, 'UTF-8') : strlen($clean);
+
+        return [Text::limit($clean, max(0, min($maxChars, $length - $margin))), $clean !== $head, $cut];
+    }
+
+    /**
+     * An exception message, redacted and cut, or a placeholder when
+     * exceptions.messages is off.
+     *
+     * @return array{0: string, 1: bool, 2: ?string}
+     */
+    private function exceptionMessage(\Throwable $exception, int $maxChars): array
+    {
+        if (!$this->setting('exceptions.messages', true)) {
+            return [self::MESSAGE_NOT_CAPTURED, false, null];
+        }
+
+        return $this->cleanText((string) $exception->getMessage(), $maxChars);
+    }
+
+    /**
+     * Whether log-monitor:off is in force. Checked at most every few
+     * seconds (one stat call), so a long-running worker notices the switch
+     * without paying for it on every event.
+     */
+    public function isSwitchedOff(): bool
+    {
+        if ($this->switchedOff === null) {
+            return false;
+        }
+        $now = $this->now();
+        if ($this->switchCheckedAt === null || $now - $this->switchCheckedAt >= self::SWITCH_CHECK_SECONDS || $now < $this->switchCheckedAt) {
+            $this->switchCheckedAt = $now;
+            try {
+                $this->off = (bool) call_user_func($this->switchedOff);
+            } catch (\Throwable $e) {
+                $this->off = false;
+            }
+        }
+
+        return $this->off;
+    }
+
+    public function sanitizer(): BodySanitizer
+    {
+        return $this->sanitizer;
     }
 
     /**
@@ -1072,14 +1211,29 @@ class Recorder
      * errors | always | never. The older outgoing.bodies_on_error flag still
      * works when bodies is not set.
      */
-    public function keepsOutgoingBodies(bool $failed): bool
+    public function keepsOutgoingBodies(bool $failed, ?string $host = null): bool
     {
         $mode = $this->setting('outgoing.bodies');
         if (!is_string($mode) || !in_array($mode, ['errors', 'always', 'never'], true)) {
-            $mode = $this->setting('outgoing.bodies_on_error', true) ? 'errors' : 'never';
+            $mode = $this->setting('outgoing.bodies_on_error', false) ? 'errors' : 'never';
+        }
+        if (!($mode === 'always' || ($mode === 'errors' && $failed))) {
+            return false;
         }
 
-        return $mode === 'always' || ($mode === 'errors' && $failed);
+        $hosts = $this->setting('outgoing.body_hosts', []);
+        if (!is_array($hosts) || $hosts === [] || $host === null) {
+            return true;
+        }
+        $host = strtolower($host);
+        foreach ($hosts as $pattern) {
+            $pattern = strtolower(trim((string) $pattern));
+            if ($pattern !== '' && ($pattern === $host || (strpos($pattern, '*.') === 0 && substr($host, -strlen($pattern) + 1) === substr($pattern, 1)))) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -1094,8 +1248,7 @@ class Recorder
     public function queryParams(array $params, ?array &$meta = null): array
     {
         $meta = ['redacted' => false, 'cut' => null];
-        $replacement = (string) $this->setting('redact.replacement', '[REDACTED]');
-        $secretNames = array_map('strtolower', (array) $this->setting('redact.query_keys', []));
+        $replacement = $this->redactor->replacement();
 
         $out = [];
         $bytes = 0;
@@ -1107,7 +1260,7 @@ class Recorder
                 continue;
             }
 
-            if ($this->redactor->isSecretName($name, $secretNames)) {
+            if ($this->redactor->isSecretName($name)) {
                 $value = $replacement;
                 $meta['redacted'] = true;
             } else {
@@ -1145,14 +1298,12 @@ class Recorder
     public function headers(array $headers, ?array &$meta = null): array
     {
         $meta = ['redacted' => false, 'cut' => count($headers) > 100 ? 'kept 100 of ' . count($headers) . ' headers' : null];
-        $sensitive = array_map('strtolower', (array) $this->setting('redact.headers', []));
-        $secretNames = (array) $this->setting('redact.query_keys', []);
-        $replacement = (string) $this->setting('redact.replacement', '[REDACTED]');
+        $replacement = $this->redactor->replacement();
         $out = [];
         foreach (array_slice($headers, 0, 100, true) as $name => $values) {
             $name = strtolower((string) $name);
             $value = is_array($values) ? implode(', ', array_map('strval', $values)) : (string) $values;
-            if (in_array($name, $sensitive, true) || $this->redactor->isSecretName($name, $secretNames)) {
+            if ($this->redactor->isSecretHeader($name)) {
                 $out[$name] = $replacement;
                 $meta['redacted'] = true;
                 continue;
@@ -1169,11 +1320,12 @@ class Recorder
     }
 
     /**
-     * Redacted body cut to $maxBytes. A cut body ends with a note of how
-     * much was kept, so a viewer never mistakes it for the whole body.
-     * Notes from BodyReader ("[streamed body not kept, 2.1 MB]") pass as is.
+     * A body parsed, masked and then cut (see BodySanitizer). Notes from
+     * BodyReader ("[streamed body not kept, 2.1 MB]") pass as is.
+     *
+     * @param array<int, string> $onlyFields
      */
-    private function outgoingBody(string $body, int $maxBytes, ?int $fullSize, ?array &$meta = null): string
+    private function outgoingBody(string $body, ?string $contentType, int $maxBytes, ?int $fullSize, array $onlyFields, ?array &$meta = null): string
     {
         $meta = ['redacted' => false, 'cut' => null];
         if (preg_match('/^\[[^\]]* not kept(, [^\]]*)?\]$/', $body) === 1) {
@@ -1182,22 +1334,10 @@ class Recorder
             return $body;
         }
 
-        // Redact before cutting, so a secret is never split in two.
-        $read = Text::limitBytes($body, $maxBytes * 4);
-        $redacted = $this->redactor->redactBody($read);
-        $kept = Text::limitBytes($redacted, $maxBytes);
-        $meta['redacted'] = self::masked($read, $redacted);
+        $clean = $this->sanitizer->sanitize($body, $contentType, $maxBytes, $fullSize, $onlyFields);
+        $meta = ['redacted' => $clean['redacted'], 'cut' => $clean['cut']];
 
-        $cut = strlen($kept) < strlen($redacted)
-            || strlen($body) > $maxBytes * 4
-            || ($fullSize !== null && $fullSize > strlen($body));
-        if ($cut) {
-            $full = max($fullSize ?? 0, strlen($body));
-            $meta['cut'] = 'kept ' . BodyReader::formatBytes(strlen($kept)) . ' of ' . BodyReader::formatBytes($full);
-            $kept .= "\n…[cut: " . $meta['cut'] . ']';
-        }
-
-        return $kept;
+        return $clean['text'];
     }
 
     /**
@@ -1213,12 +1353,6 @@ class Recorder
         $b = json_decode($after, true);
 
         return !(is_array($a) && is_array($b) && $a == $b);
-    }
-
-    private function body(string $body, int $maxBytes): string
-    {
-        // Redact before cutting, so a secret is never split in two.
-        return Text::limitBytes($this->redactor->redactBody(Text::limitBytes($body, $maxBytes * 4)), $maxBytes);
     }
 
     /**
@@ -1248,6 +1382,7 @@ class Recorder
      */
     private function normalizeContext(array $context): array
     {
+        $this->contextBudget = self::CONTEXT_MAX_VALUES;
         $normalized = $this->normalizeValue($context, 0);
 
         return is_array($normalized) ? $normalized : [];
@@ -1266,7 +1401,8 @@ class Recorder
             return is_finite($value) ? $value : (string) $value;
         }
         if (is_string($value)) {
-            return Text::limit($value, self::MESSAGE_MAX);
+            // Long strings are redacted before they are cut (see cleanText).
+            return self::cutNote($value, self::MESSAGE_MAX) === null ? $value : $this->cleanText($value, self::MESSAGE_MAX)[0];
         }
         if ($depth >= self::CONTEXT_MAX_DEPTH) {
             return '[depth limit]';
@@ -1275,8 +1411,8 @@ class Recorder
             $out = [];
             $i = 0;
             foreach ($value as $key => $item) {
-                if ($i++ >= self::CONTEXT_MAX_ITEMS) {
-                    $out['_more'] = count($value) - self::CONTEXT_MAX_ITEMS;
+                if ($i++ >= self::CONTEXT_MAX_ITEMS || --$this->contextBudget < 0) {
+                    $out['_more'] = count($value) - $i + 1;
                     break;
                 }
                 $out[$key] = $this->normalizeValue($item, $depth + 1);
@@ -1287,7 +1423,7 @@ class Recorder
         if ($value instanceof \Throwable) {
             return [
                 'class' => get_class($value),
-                'message' => Text::limit((string) $value->getMessage(), 1000),
+                'message' => $this->exceptionMessage($value, 1000)[0],
                 'file' => $this->location->relative((string) $value->getFile()),
                 'line' => (int) $value->getLine(),
             ];
@@ -1302,7 +1438,7 @@ class Recorder
             return $this->normalizeValue($value->toArray(), $depth + 1);
         }
         if (is_object($value) && method_exists($value, '__toString')) {
-            return Text::limit((string) $value, self::MESSAGE_MAX);
+            return $this->normalizeValue((string) $value, $depth);
         }
         if (is_object($value)) {
             return ['class' => get_class($value)];

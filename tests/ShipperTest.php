@@ -53,6 +53,40 @@ final class ShipperTest extends TestCase
         return $out;
     }
 
+    public function testTheTimeBudgetIsCheckedBeforeEveryRequest(): void
+    {
+        file_put_contents($this->directory->currentPath(), $this->lines(5));
+        $now = 1000.0;
+        $transport = new class($now) implements \DevZone\LogMonitor\Transport\Transport {
+            /** @var float */
+            public $clock;
+
+            public function __construct(float &$clock)
+            {
+                $this->clock = &$clock;
+            }
+
+            public function send(string $json): array
+            {
+                $this->clock += 20; // a slow server
+
+                return ['ok' => true, 'status' => 202, 'retryable' => false, 'error' => null];
+            }
+        };
+        $shipper = new Shipper($this->directory, $transport, [
+            'shipping' => ['records_per_request' => 1, 'max_bytes_per_request' => 1048576, 'time_budget_seconds' => 50, 'quarantine_after' => 3],
+            'spool' => ['max_total_bytes' => 0, 'max_age_days' => 0],
+        ], [], function () use (&$now) {
+            return $now;
+        });
+
+        $summary = $shipper->run();
+
+        $this->assertSame('time budget reached', $summary['stopped']);
+        $this->assertSame(3, $summary['requests'], 'stopped inside the batch, not after all five');
+        $this->assertSame(['sent' => 3, 'failures' => 0, 'last_error' => null], $this->directory->progress($this->directory->batches()[0]));
+    }
+
     public function testRotatesSendsAndDeletes(): void
     {
         file_put_contents($this->directory->currentPath(), $this->lines(3));

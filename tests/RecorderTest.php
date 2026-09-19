@@ -35,7 +35,7 @@ final class RecorderTest extends TestCase
                 'repeated_threshold' => 10,
                 'max_slow_per_request' => 100,
             ],
-            'outgoing' => ['enabled' => true, 'bodies_on_error' => true, 'max_bytes' => 8192, 'max_per_request' => 500],
+            'outgoing' => ['enabled' => true, 'bodies_on_error' => true, 'headers' => true, 'max_bytes' => 8192, 'max_per_request' => 500],
             'logs' => ['enabled' => true, 'level' => 'warning', 'max_per_request' => 200],
             'exceptions' => ['enabled' => true, 'max_frames' => 50],
             'jobs' => ['enabled' => true, 'flush_records' => 500, 'flush_seconds' => 30, 'overrides' => []],
@@ -45,7 +45,7 @@ final class RecorderTest extends TestCase
         return new Recorder(
             $config,
             $this->sink,
-            new Redactor(),
+            Redactor::fromConfig(isset($config['redact']) && is_array($config['redact']) ? $config['redact'] : []),
             new Location(dirname(__DIR__)),
             function () {
                 return $this->now;
@@ -286,15 +286,15 @@ final class RecorderTest extends TestCase
         $this->assertTrue($this->recorder(['outgoing' => ['enabled' => true, 'bodies_on_error' => true]])->keepsOutgoingBodies(true));
     }
 
-    public function testALargeResponseBodyIsCutRedactedAndMarked(): void
+    public function testABodyIsMaskedWholeAndOnlyThenCut(): void
     {
         $recorder = $this->recorder(['outgoing.bodies' => 'always']);
         $execution = $recorder->startRequest();
-        $json = '{"card_number":"4111111111111111","rows":[' . implode(',', array_fill(0, 60000, '{"id":1,"name":"x"}')) . ']}';
+        $rows = implode(',', array_fill(0, 1500, '{"id":1,"name":"x"}'));
+        $json = '{"rows":[' . $rows . '],"card_number":"4111111111111111","otp":"SYNTHOTP"}';
         $recorder->recordOutgoing([
             'method' => 'GET', 'url' => 'https://api.bank.example/statement', 'status' => 200,
-            // What BodyReader hands over: the first 32 KB and the full size.
-            'response_body' => substr($json, 0, 32768), 'response_body_size' => strlen($json),
+            'response_body' => $json, 'response_body_size' => strlen($json), 'response_body_type' => 'application/json',
             'request_body' => '{"from":"2026-09-01"}', 'request_body_size' => 21,
         ]);
         $recorder->finishRequest($execution, ['status' => 200]);
@@ -302,9 +302,26 @@ final class RecorderTest extends TestCase
         $call = $this->sink->records('outgoing')[0];
         [$kept, $note] = explode("\n…", $call['response_body']);
         $this->assertLessThanOrEqual(8192, strlen($kept));
-        $this->assertSame('[cut: kept 8 KB of 1.1 MB]', $note);
-        $this->assertStringNotContainsString('4111111111111111', $kept, 'redacted although the JSON no longer parses');
+        $this->assertSame('[cut: kept 8 KB of 29.4 KB]', $note);
+        $this->assertStringNotContainsString('SYNTHOTP', json_encode($call));
         $this->assertSame('{"from":"2026-09-01"}', $call['request_body'], 'a small body is kept whole, unmarked');
+    }
+
+    public function testABodyOverTheParseLimitIsNotKept(): void
+    {
+        $recorder = $this->recorder(['outgoing.bodies' => 'always']);
+        $execution = $recorder->startRequest();
+        $json = '{"card_number":"4111111111111111","rows":[' . implode(',', array_fill(0, 60000, '{"id":1,"name":"x"}')) . ']}';
+        $recorder->recordOutgoing([
+            'method' => 'GET', 'url' => 'https://api.bank.example/statement', 'status' => 200,
+            // What BodyReader hands over: the first 64 KB + 1 byte and the full size.
+            'response_body' => substr($json, 0, 65537), 'response_body_size' => strlen($json),
+        ]);
+        $recorder->finishRequest($execution, ['status' => 200]);
+
+        $call = $this->sink->records('outgoing')[0];
+        $this->assertSame('[json body not kept, 1.1 MB: over the 64 KB parse limit]', $call['response_body']);
+        $this->assertSame(['response_body' => 'json body not kept, 1.1 MB: over the 64 KB parse limit'], $call['_cut']);
     }
 
     public function testNotesFromTheBodyReaderPassThrough(): void
@@ -319,10 +336,10 @@ final class RecorderTest extends TestCase
 
     public function testAnOversizedCallKeepsItsHeadersAndShortensItsBodies(): void
     {
-        $recorder = $this->recorder(['outgoing.bodies' => 'always', 'spool.max_record_bytes' => 32768]);
+        $recorder = $this->recorder(['outgoing.bodies' => 'always', 'spool.max_record_bytes' => 16384]);
         $execution = $recorder->startRequest();
         // Quotes and newlines double in JSON: 8 KB each becomes ~16 KB each.
-        $escaped = str_repeat("\"\n", 4096);
+        $escaped = json_encode(array_fill(0, 1500, "\"\n\"\n"));
         $recorder->recordOutgoing([
             'method' => 'POST', 'url' => 'https://api.bank.example/soap', 'status' => 500,
             'request_headers' => ['Accept' => 'text/xml', 'X-Trace' => 'abc'],
@@ -442,7 +459,7 @@ final class RecorderTest extends TestCase
 
         $call = $this->sink->records('outgoing')[0];
         $this->assertEqualsCanonicalizing(['query', 'request_headers', 'request_body'], $call['_redacted']);
-        $this->assertSame(['response_body' => 'kept 8 KB of 1 MB'], $call['_cut']);
+        $this->assertSame(['response_body' => 'text body not kept, 1 MB'], $call['_cut']);
     }
 
     public function testCleanFieldsCarryNoTags(): void
@@ -472,14 +489,14 @@ final class RecorderTest extends TestCase
 
     public function testRecordsShrunkToFitSayWhatWasDropped(): void
     {
-        $recorder = $this->recorder(['outgoing.bodies' => 'always', 'spool.max_record_bytes' => 32768]);
+        $recorder = $this->recorder(['outgoing.bodies' => 'always', 'spool.max_record_bytes' => 16384]);
         $execution = $recorder->startRequest();
-        $escaped = str_repeat("\"\n", 4096);
+        $escaped = json_encode(array_fill(0, 1500, "\"\n\"\n"));
         $recorder->recordOutgoing(['method' => 'POST', 'url' => 'https://api.example/soap', 'status' => 500, 'request_body' => $escaped, 'response_body' => $escaped]);
         $recorder->finishRequest($execution, ['status' => 200]);
 
         $call = $this->sink->records('outgoing')[0];
-        $this->assertSame('shortened to 2 KB to fit the 32 KB record limit', $call['_cut']['response_body']);
+        $this->assertSame('shortened to 2 KB to fit the 16 KB record limit', $call['_cut']['response_body']);
     }
 
     public function testLogsFollowTheirOwnLevelAndCarryTheTrace(): void
@@ -605,6 +622,101 @@ final class RecorderTest extends TestCase
         $request = $this->sink->records('request')[0];
         $this->assertTrue($request['interrupted']);
         $this->assertNull($request['status']);
+    }
+
+    public function testTheKillSwitchIsCheckedWhileRunning(): void
+    {
+        $off = false;
+        $this->sink = new MemorySink();
+        $recorder = new Recorder(['queries' => ['enabled' => true], 'logs' => ['enabled' => true, 'level' => 'debug']], $this->sink, new Redactor(), new Location(dirname(__DIR__)),
+            function () {
+                return $this->now;
+            },
+            null,
+            function () use (&$off) {
+                return $off;
+            }
+        );
+
+        $running = $recorder->startJob(['class' => 'App\\Jobs\\Long', 'job_id' => '1'], null);
+        $off = true;
+        $this->now += 10; // past the check interval
+        $recorder->recordLog('info', 'still running', []);
+        $recorder->finishJob($running, 'processed');
+        $this->assertSame([], $this->sink->writes, 'an execution in progress when switched off writes nothing');
+        $this->assertNull($recorder->startJob(['class' => 'App\\Jobs\\Next', 'job_id' => '2'], null));
+        $this->assertNull($recorder->startRequest());
+
+        $off = false;
+        $this->now += 10;
+        $this->assertNotNull($recorder->startRequest(), 'log-monitor:on resumes without a restart');
+    }
+
+    public function testDistinctStatementsAreCapped(): void
+    {
+        $recorder = $this->recorder(['queries.mode' => 'summary', 'queries.max_statements' => 50, 'queries.slow_ms' => 0, 'queries.repeated_threshold' => 0]);
+        $execution = $recorder->startRequest();
+        for ($i = 0; $i < 20000; $i++) {
+            $recorder->recordQuery("select * from t where note = 'value {$i}' /* " . str_repeat('x', 200) . ' */', 1.0, 'mysql', 'mysql');
+        }
+        $this->assertCount(50, $execution->statements);
+        $this->assertLessThan(64 * 1024, $execution->statementBytes);
+        $recorder->finishRequest($execution, ['status' => 200]);
+
+        $request = $this->sink->records('request')[0];
+        $this->assertSame(20000, $request['queries'], 'every query is still counted');
+        $this->assertSame(19950, $request['dropped']['statements']);
+    }
+
+    public function testARequestStopsBufferingAtTheMemoryBudget(): void
+    {
+        $recorder = $this->recorder(['logs.level' => 'debug', 'logs.max_per_request' => 10000, 'memory.max_buffer_bytes' => 50000]);
+        $execution = $recorder->startRequest();
+        for ($i = 0; $i < 200; $i++) {
+            $recorder->recordLog('info', str_repeat('m', 900), []);
+        }
+        $this->assertLessThanOrEqual(50000, $execution->bufferedBytes);
+        $recorder->finishRequest($execution, ['status' => 200]);
+
+        $request = $this->sink->records('request')[0];
+        $this->assertSame(200, $request['logs']);
+        $this->assertGreaterThan(100, $request['dropped']['memory']);
+        $this->assertSame(200 - $request['dropped']['memory'], count($this->sink->records('log')));
+    }
+
+    public function testAJobFlushesAtTheMemoryBudget(): void
+    {
+        $recorder = $this->recorder(['logs.level' => 'debug', 'logs.max_per_request' => 10000, 'memory.max_buffer_bytes' => 50000, 'jobs.flush_records' => 0, 'jobs.flush_seconds' => 0]);
+        $job = $recorder->startJob(['class' => 'App\\Jobs\\Import', 'job_id' => '9'], null);
+        for ($i = 0; $i < 200; $i++) {
+            $recorder->recordLog('info', str_repeat('m', 900), []);
+            $this->assertLessThanOrEqual(50000, $job->bufferedBytes);
+        }
+        $recorder->finishJob($job, 'processed');
+
+        $this->assertCount(200, $this->sink->records('log'), 'nothing lost');
+        $this->assertGreaterThan(1, $this->sink->records('job')[0]['partial_flushes']);
+    }
+
+    public function testBodiesAreKeptOnlyForListedHosts(): void
+    {
+        $recorder = $this->recorder(['outgoing.bodies' => 'always', 'outgoing.body_hosts' => ['api.bank.example', '*.partner.example']]);
+        $this->assertTrue($recorder->keepsOutgoingBodies(false, 'api.bank.example'));
+        $this->assertTrue($recorder->keepsOutgoingBodies(false, 'eu.partner.example'));
+        $this->assertFalse($recorder->keepsOutgoingBodies(false, 'partner.example.evil.test'));
+        $this->assertFalse($recorder->keepsOutgoingBodies(false, 'other.example'));
+    }
+
+    public function testMessagesAndContextCanBeLeftOut(): void
+    {
+        $recorder = $this->recorder(['logs.level' => 'debug', 'logs.context' => false, 'exceptions.messages' => false]);
+        $recorder->recordLog('info', 'hello', ['customer' => 'Bob']);
+        $recorder->recordException(new \RuntimeException('Customer Bob Khan not found'));
+
+        $log = $this->sink->records('log')[0];
+        $this->assertSame([], $log['context']);
+        $this->assertSame('not captured (logs.context is off)', $log['_cut']['context']);
+        $this->assertSame('[message not captured]', $this->sink->records('exception')[0]['message']);
     }
 
     public function testDisabledQueriesAreIgnored(): void
