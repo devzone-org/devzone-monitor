@@ -55,6 +55,35 @@ LOG_MONITOR_APP="${APP_NAME}"
 LOG_MONITOR_LOG_LEVEL=warning
 ```
 
+Optional, to keep headers and bodies of your own app's requests (they are
+kept for 5xx responses by default; query parameters are kept for every
+request):
+
+```env
+LOG_MONITOR_REQUEST_BODIES_ROUTES="integrations/*,webhooks/*"   # URI patterns or route names
+LOG_MONITOR_REQUEST_BODIES_SLOW_MS=2000                         # also when slower than this
+LOG_MONITOR_REQUEST_BODIES_ON_STATUS=500                        # and when status >= this
+```
+
+Optional, for outgoing HTTP calls:
+
+```env
+LOG_MONITOR_OUTGOING_BODIES=errors   # errors (default) | always | never
+LOG_MONITOR_OUTGOING_HEADERS=true    # headers of every call; Authorization, Cookie etc. masked
+```
+
+`always` also stores successful responses, which for bank and payment APIs
+means customer data; turn it on while debugging and back to `errors` after.
+
+Large bodies never slow the app down or use its memory: at most 32 KB of a
+body is read (a 200 MB download costs the same as a 2 KB one), the stream is
+put back exactly where it was, and 8 KB (`outgoing.max_bytes`) is kept after
+redaction, ending with a note such as `…[cut: kept 8 KB of 1.2 MB]`.
+Streamed responses (`'stream' => true`, sinks) are never read, and files,
+images, PDFs, archives and multipart uploads are kept only as a note of their
+type and size. A call that would still exceed the 32 KB record limit keeps
+its headers and has its bodies shortened, then dropped.
+
 On a server with cached config, run `php artisan config:cache` afterwards.
 
 ### Scheduler
@@ -88,7 +117,7 @@ both are normally `forge`; `log-monitor:install` warns when they differ.
 | `queries` | Sampled executions, `all` mode, or any execution that errored | Each distinct SQL statement once, then every run as `[hash, ms]` |
 | `slow-query` | A query over `slow_ms` | SQL, duration, the file and line in your code that ran it |
 | `repeated-query` | The same statement run `repeated_threshold` times in one execution (N+1) | SQL, count, total time, file and line |
-| `outgoing` | Every call made with Laravel's `Http::` client | Method, host, path, status, duration, sizes. Redacted bodies only when the call failed |
+| `outgoing` | Every call made with Laravel's `Http::` client | Method, host, path, status, duration, sizes, request and response headers (secrets masked). Redacted bodies when the call failed, or always / never with `LOG_MONITOR_OUTGOING_BODIES` |
 | `log` | `Log::` calls at or above `logs.level`, on any channel | Level, message, context, fingerprint |
 | `exception` | Exceptions reported through Laravel (and fatal errors) | Class, message, file and line, frames without arguments, previous exceptions, fingerprint |
 | `job` | Every queued job run | Class, queue, connection, attempt, status (`processed`, `failed`, `released`, `exception`, `interrupted`), duration, parent trace, totals |

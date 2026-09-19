@@ -149,7 +149,7 @@ class Recorder
                 if (!empty($info['interrupted'])) {
                     $record['interrupted'] = true;
                 }
-                foreach (['request_headers', 'request_body', 'response_body'] as $key) {
+                foreach (['query', 'request_headers', 'request_body', 'response_body', '_redacted', '_cut'] as $key) {
                     if (isset($info[$key])) {
                         $record[$key] = $info[$key];
                     }
@@ -238,10 +238,9 @@ class Recorder
             ] + $this->totals($execution);
 
             if ($exception !== null) {
-                $record['exception'] = [
-                    'class' => get_class($exception),
-                    'message' => $this->redactor->redactString(Text::limit((string) $exception->getMessage(), 1000)),
-                ];
+                [$message, $redacted, $cut] = $this->cleanText((string) $exception->getMessage(), 1000);
+                $record['exception'] = ['class' => get_class($exception), 'message' => $message];
+                self::mark($record, 'exception.message', $redacted, $cut);
             }
 
             $lines = array_merge([$this->encode($record)], $this->detailLines($execution, true));
@@ -278,10 +277,9 @@ class Recorder
                 'status' => 'failed',
             ];
             if ($exception !== null) {
-                $record['exception'] = [
-                    'class' => get_class($exception),
-                    'message' => $this->redactor->redactString(Text::limit((string) $exception->getMessage(), 1000)),
-                ];
+                [$message, $redacted, $cut] = $this->cleanText((string) $exception->getMessage(), 1000);
+                $record['exception'] = ['class' => get_class($exception), 'message' => $message];
+                self::mark($record, 'exception.message', $redacted, $cut);
             }
             $this->write([$this->encode($record)]);
         } catch (\Throwable $e) {
@@ -437,13 +435,31 @@ class Recorder
                 'response_bytes' => $call['response_bytes'] ?? null,
             ];
             if (!empty($call['error'])) {
-                $record['error'] = $this->redactor->redactString(Text::limit((string) $call['error'], 1000));
+                [$record['error'], $redacted, $cut] = $this->cleanText((string) $call['error'], 1000);
+                self::mark($record, 'error', $redacted, $cut);
             }
-            if ($failed && $execution->setting('outgoing.bodies_on_error', true)) {
+            if (isset($parts['query']) && $parts['query'] !== '') {
+                parse_str((string) $parts['query'], $params);
+                if ($params !== []) {
+                    $record['query'] = $this->queryParams($params, $meta);
+                    self::mark($record, 'query', $meta['redacted'], $meta['cut']);
+                }
+            }
+            if ($execution->setting('outgoing.headers', true)) {
+                foreach (['request_headers', 'response_headers'] as $key) {
+                    if (isset($call[$key]) && is_array($call[$key]) && $call[$key] !== []) {
+                        $record[$key] = $this->headers($call[$key], $meta);
+                        self::mark($record, $key, $meta['redacted'], $meta['cut']);
+                    }
+                }
+            }
+            if ($this->keepsOutgoingBodies($failed)) {
                 $max = (int) $execution->setting('outgoing.max_bytes', 8192);
                 foreach (['request_body', 'response_body'] as $key) {
                     if (isset($call[$key]) && is_string($call[$key]) && $call[$key] !== '') {
-                        $record[$key] = $this->body($call[$key], $max);
+                        $size = isset($call[$key . '_size']) && is_int($call[$key . '_size']) ? $call[$key . '_size'] : null;
+                        $record[$key] = $this->outgoingBody($call[$key], $max, $size, $meta);
+                        self::mark($record, $key, $meta['redacted'], $meta['cut']);
                     }
                 }
             }
@@ -486,8 +502,10 @@ class Recorder
                 return;
             }
 
-            $text = $this->redactor->redactString($this->stringify($message));
+            $raw = $this->stringify($message);
+            $text = $this->redactor->redactString($raw);
             $normalizedContext = $this->normalizeContext($context);
+            $redactedContext = $this->redactor->redact($normalizedContext);
             $record = [
                 't' => 'log',
                 'v' => self::RECORD_VERSION,
@@ -496,9 +514,11 @@ class Recorder
                 'level' => strtolower($level),
                 'severity' => Levels::severity($level),
                 'message' => Text::limit($text, self::MESSAGE_MAX),
-                'context' => $this->redactor->redact($normalizedContext),
+                'context' => $redactedContext,
                 'fingerprint' => Fingerprint::log($level, $text),
             ];
+            self::mark($record, 'message', $text !== $raw, self::cutNote($text, self::MESSAGE_MAX));
+            self::mark($record, 'context', $redactedContext !== $normalizedContext);
 
             if ($execution === null) {
                 $this->write([$this->encode($record)]);
@@ -598,13 +618,15 @@ class Recorder
             $cause = $cause->getPrevious();
         }
 
-        return [
+        $raw = (string) $exception->getMessage();
+        $message = $this->redactor->redactString($raw);
+        $record = [
             't' => 'exception',
             'v' => self::RECORD_VERSION,
             'trace' => $execution !== null ? $execution->trace : null,
             'at' => $this->iso($this->now()),
             'class' => get_class($exception),
-            'message' => Text::limit($this->redactor->redactString((string) $exception->getMessage()), self::MESSAGE_MAX),
+            'message' => Text::limit($message, self::MESSAGE_MAX),
             'code' => (string) $exception->getCode(),
             'file' => $file,
             'line' => $line,
@@ -612,6 +634,9 @@ class Recorder
             'previous' => $previous,
             'fingerprint' => Fingerprint::exception(get_class($exception), $file, $line),
         ];
+        self::mark($record, 'message', $message !== $raw, self::cutNote($message, self::MESSAGE_MAX));
+
+        return $record;
     }
 
     /**
@@ -910,32 +935,51 @@ class Recorder
             return $json;
         }
 
-        // Drop or cut the bulky parts, biggest offenders first.
+        $limitNote = 'to fit the ' . BodyReader::formatBytes($limit) . ' record limit';
+
+        // Drop or cut the bulky parts, biggest offenders first; headers
+        // outlive bodies, bodies are shortened before they are dropped.
         $steps = [
-            function (array $r) {
-                unset($r['request_body'], $r['response_body'], $r['request_headers']);
+            function (array $r) use ($limitNote) {
+                foreach (['request_body', 'response_body'] as $key) {
+                    if (isset($r[$key]) && is_string($r[$key]) && strlen($r[$key]) > 2048) {
+                        $r[$key] = Text::limitBytes($r[$key], 2048) . "\n…[cut to fit the record size limit]";
+                        self::mark($r, $key, false, 'shortened to 2 KB ' . $limitNote);
+                    }
+                }
 
                 return $r;
             },
-            function (array $r) {
+            function (array $r) use ($limitNote) {
+                return self::drop($r, ['request_body', 'response_body'], 'dropped ' . $limitNote);
+            },
+            function (array $r) use ($limitNote) {
+                return self::drop($r, ['request_headers', 'response_headers'], 'dropped ' . $limitNote);
+            },
+            function (array $r) use ($limitNote) {
+                return self::drop($r, ['query'], 'dropped ' . $limitNote);
+            },
+            function (array $r) use ($limitNote) {
                 if (isset($r['context'])) {
                     $r['context'] = ['_truncated' => true];
+                    self::mark($r, 'context', false, 'dropped ' . $limitNote);
                 }
-                if (isset($r['frames'])) {
+                if (isset($r['frames']) && is_array($r['frames']) && count($r['frames']) > 10) {
+                    self::mark($r, 'frames', false, 'kept 10 of ' . count($r['frames']) . ' ' . $limitNote);
                     $r['frames'] = array_slice($r['frames'], 0, 10);
                 }
 
                 return $r;
             },
-            function (array $r) {
+            function (array $r) use ($limitNote) {
                 foreach (['message', 'sql', 'error'] as $key) {
-                    if (isset($r[$key]) && is_string($r[$key])) {
+                    if (isset($r[$key]) && is_string($r[$key]) && mb_strlen($r[$key]) > 1000) {
                         $r[$key] = Text::limit($r[$key], 1000);
+                        self::mark($r, $key, false, 'shortened to 1,000 characters ' . $limitNote);
                     }
                 }
-                unset($r['previous']);
 
-                return $r;
+                return self::drop($r, ['previous'], 'dropped ' . $limitNote);
             },
         ];
         foreach ($steps as $step) {
@@ -953,7 +997,64 @@ class Recorder
             'trace' => $record['trace'] ?? null,
             'at' => $record['at'] ?? $this->iso($this->now()),
             '_truncated' => true,
+            '_cut' => ['record' => 'details dropped ' . $limitNote],
         ]);
+    }
+
+    /**
+     * Tags a record field as masked (_redacted: list of fields) and/or cut
+     * (_cut: field => what happened), so the server can say so next to it.
+     *
+     * @param array<string, mixed> $record
+     */
+    public static function mark(array &$record, string $field, bool $redacted, ?string $cut = null): void
+    {
+        if ($redacted && !in_array($field, $record['_redacted'] ?? [], true)) {
+            $record['_redacted'][] = $field;
+        }
+        if ($cut !== null) {
+            $record['_cut'][$field] = $cut;
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $record
+     * @param array<int, string> $fields
+     * @return array<string, mixed>
+     */
+    private static function drop(array $record, array $fields, string $note): array
+    {
+        foreach ($fields as $field) {
+            if (array_key_exists($field, $record)) {
+                unset($record[$field]);
+                self::mark($record, $field, false, $note);
+            }
+        }
+
+        return $record;
+    }
+
+    /**
+     * Text cut to $maxChars, then redacted.
+     *
+     * @return array{0: string, 1: bool, 2: ?string} [text, was anything masked, cut note]
+     */
+    private function cleanText(string $raw, int $maxChars): array
+    {
+        $limited = Text::limit($raw, $maxChars);
+        $clean = $this->redactor->redactString($limited);
+
+        return [$clean, $clean !== $limited, self::cutNote($raw, $maxChars)];
+    }
+
+    /**
+     * "kept 4,000 of 12,345 characters" when $text is longer than $maxChars.
+     */
+    public static function cutNote(string $text, int $maxChars): ?string
+    {
+        $length = function_exists('mb_strlen') ? mb_strlen($text, 'UTF-8') : strlen($text);
+
+        return $length > $maxChars ? 'kept ' . number_format($maxChars) . ' of ' . number_format($length) . ' characters' : null;
     }
 
     private static function json(array $record): ?string
@@ -964,6 +1065,153 @@ class Recorder
         );
 
         return is_string($json) ? $json : null;
+    }
+
+    /**
+     * Whether outgoing bodies are kept for a call: outgoing.bodies is
+     * errors | always | never. The older outgoing.bodies_on_error flag still
+     * works when bodies is not set.
+     */
+    public function keepsOutgoingBodies(bool $failed): bool
+    {
+        $mode = $this->setting('outgoing.bodies');
+        if (!is_string($mode) || !in_array($mode, ['errors', 'always', 'never'], true)) {
+            $mode = $this->setting('outgoing.bodies_on_error', true) ? 'errors' : 'never';
+        }
+
+        return $mode === 'always' || ($mode === 'errors' && $failed);
+    }
+
+    /**
+     * Query parameters as name => value, masked and bounded: secret-looking
+     * names (redact.keys and redact.query_keys) masked, values run through
+     * the redactor, nested values kept as JSON, at most 50 parameters of 500
+     * characters and 8 KB in all. What does not fit is counted in a note.
+     *
+     * @param array<string, mixed> $params
+     * @return array<string, string>
+     */
+    public function queryParams(array $params, ?array &$meta = null): array
+    {
+        $meta = ['redacted' => false, 'cut' => null];
+        $replacement = (string) $this->setting('redact.replacement', '[REDACTED]');
+        $secretNames = array_map('strtolower', (array) $this->setting('redact.query_keys', []));
+
+        $out = [];
+        $bytes = 0;
+        $skipped = 0;
+        foreach ($params as $name => $value) {
+            $name = Text::limit((string) $name, 100);
+            if (count($out) >= 50) {
+                $skipped++;
+                continue;
+            }
+
+            if (in_array(strtolower($name), $secretNames, true) || $this->redactor->isSensitiveKey($name)) {
+                $value = $replacement;
+                $meta['redacted'] = true;
+            } else {
+                $clean = $this->redactor->redact($value);
+                $meta['redacted'] = $meta['redacted'] || $clean !== $value;
+                $value = is_array($clean) ? (string) self::json($clean) : (is_scalar($clean) || $clean === null ? (string) $clean : '');
+                if (self::cutNote($value, 500) !== null) {
+                    $meta['cut'] = 'long values cut to 500 characters';
+                }
+                $value = Text::limit($value, 500);
+            }
+
+            $bytes += strlen($name) + strlen($value);
+            if ($bytes > 8192) {
+                $skipped++;
+                continue;
+            }
+            $out[$name] = $value;
+        }
+        if ($skipped > 0) {
+            $out['…'] = "[{$skipped} more parameter" . ($skipped === 1 ? '' : 's') . ' not kept]';
+            $meta['cut'] = "kept " . (count($out) - 1) . ' of ' . (count($out) - 1 + $skipped) . ' parameters';
+        }
+
+        return $out;
+    }
+
+    /**
+     * Header name => value, lower-cased names, with the names listed in
+     * redact.headers masked and every other value redacted and cut.
+     *
+     * @param array<string, mixed> $headers name => string or list of strings
+     * @return array<string, string>
+     */
+    public function headers(array $headers, ?array &$meta = null): array
+    {
+        $meta = ['redacted' => false, 'cut' => count($headers) > 100 ? 'kept 100 of ' . count($headers) . ' headers' : null];
+        $sensitive = array_map('strtolower', (array) $this->setting('redact.headers', []));
+        $replacement = (string) $this->setting('redact.replacement', '[REDACTED]');
+        $out = [];
+        foreach (array_slice($headers, 0, 100, true) as $name => $values) {
+            $name = strtolower((string) $name);
+            $value = is_array($values) ? implode(', ', array_map('strval', $values)) : (string) $values;
+            if (in_array($name, $sensitive, true)) {
+                $out[$name] = $replacement;
+                $meta['redacted'] = true;
+                continue;
+            }
+            $clean = $this->redactor->redactString($value);
+            $meta['redacted'] = $meta['redacted'] || $clean !== $value;
+            if ($meta['cut'] === null && self::cutNote($clean, 500) !== null) {
+                $meta['cut'] = 'long values cut to 500 characters';
+            }
+            $out[$name] = Text::limit($clean, 500);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Redacted body cut to $maxBytes. A cut body ends with a note of how
+     * much was kept, so a viewer never mistakes it for the whole body.
+     * Notes from BodyReader ("[streamed body not kept, 2.1 MB]") pass as is.
+     */
+    private function outgoingBody(string $body, int $maxBytes, ?int $fullSize, ?array &$meta = null): string
+    {
+        $meta = ['redacted' => false, 'cut' => null];
+        if (preg_match('/^\[[^\]]* not kept(, [^\]]*)?\]$/', $body) === 1) {
+            $meta['cut'] = trim($body, '[]');
+
+            return $body;
+        }
+
+        // Redact before cutting, so a secret is never split in two.
+        $read = Text::limitBytes($body, $maxBytes * 4);
+        $redacted = $this->redactor->redactBody($read);
+        $kept = Text::limitBytes($redacted, $maxBytes);
+        $meta['redacted'] = self::masked($read, $redacted);
+
+        $cut = strlen($kept) < strlen($redacted)
+            || strlen($body) > $maxBytes * 4
+            || ($fullSize !== null && $fullSize > strlen($body));
+        if ($cut) {
+            $full = max($fullSize ?? 0, strlen($body));
+            $meta['cut'] = 'kept ' . BodyReader::formatBytes(strlen($kept)) . ' of ' . BodyReader::formatBytes($full);
+            $kept .= "\n…[cut: " . $meta['cut'] . ']';
+        }
+
+        return $kept;
+    }
+
+    /**
+     * Whether redaction changed a body. JSON is re-encoded by the redactor,
+     * so compare decoded values rather than bytes.
+     */
+    public static function masked(string $before, string $after): bool
+    {
+        if ($before === $after) {
+            return false;
+        }
+        $a = json_decode($before, true);
+        $b = json_decode($after, true);
+
+        return !(is_array($a) && is_array($b) && $a == $b);
     }
 
     private function body(string $body, int $maxBytes): string

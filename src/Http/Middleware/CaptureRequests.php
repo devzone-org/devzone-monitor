@@ -3,6 +3,7 @@
 namespace DevZone\LogMonitor\Http\Middleware;
 
 use Closure;
+use DevZone\LogMonitor\Capture\BodyReader;
 use DevZone\LogMonitor\Capture\Execution;
 use DevZone\LogMonitor\Capture\Recorder;
 use DevZone\LogMonitor\Support\CurrentUser;
@@ -113,13 +114,21 @@ class CaptureRequests
             'bootstrap_ms' => defined('LARAVEL_START') ? round(($execution->startedAt - (float) LARAVEL_START) * 1000, 2) : null,
         ];
 
+        $params = $request->query->all();
+        if ($params !== []) {
+            $info['query'] = $this->recorder->queryParams($params, $meta);
+            Recorder::mark($info, 'query', $meta['redacted'], $meta['cut']);
+        }
+
         if ($this->shouldCaptureBodies($request, $status, $execution)) {
             $max = (int) $this->recorder->setting('requests.bodies.max_bytes', 8192);
-            $info['request_headers'] = $this->headers($request);
-            $info['request_body'] = $this->requestBody($request, $max);
-            $body = $this->responseBody($response, $max);
-            if ($body !== null) {
-                $info['response_body'] = $body;
+            $info['request_headers'] = $this->recorder->headers($request->headers->all(), $meta);
+            Recorder::mark($info, 'request_headers', $meta['redacted'], $meta['cut']);
+            foreach (['request_body' => $this->requestBody($request, $max), 'response_body' => $this->responseBody($response, $max)] as $key => $body) {
+                if ($body !== null) {
+                    $info[$key] = $body['text'];
+                    Recorder::mark($info, $key, $body['redacted'], $body['cut']);
+                }
             }
         }
 
@@ -157,24 +166,56 @@ class CaptureRequests
     /**
      * @param Request $request
      */
-    private function requestBody($request, int $max): ?string
+    /**
+     * @return array{text: string, redacted: bool, cut: ?string}|null
+     */
+    private function requestBody($request, int $max): ?array
     {
         $files = $request->allFiles();
         $input = $files === [] ? $request->input() : $request->except(array_keys($files));
         if (is_array($input) && $input !== []) {
-            $json = json_encode($this->redactor->redact($input), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR);
+            $clean = $this->redactor->redact($input);
+            $json = json_encode($clean, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR);
+            if (!is_string($json)) {
+                return null;
+            }
+            $note = $files !== [] ? count($files) . ' uploaded file(s) not kept' : null;
 
-            return is_string($json) ? Text::limitBytes($json, $max) : null;
+            return $this->bounded($json, $max, $clean != $input, $note);
         }
         $raw = (string) $request->getContent();
+        if ($raw === '') {
+            return null;
+        }
+        $read = Text::limitBytes($raw, $max * 4);
+        $clean = $this->redactor->redactBody($read);
 
-        return $raw === '' ? null : Text::limitBytes($this->redactor->redactBody(Text::limitBytes($raw, $max * 4)), $max);
+        return $this->bounded($clean, $max, Recorder::masked($read, $clean), null, strlen($raw));
+    }
+
+    /**
+     * @return array{text: string, redacted: bool, cut: ?string}
+     */
+    private function bounded(string $text, int $max, bool $redacted, ?string $note = null, ?int $fullSize = null): array
+    {
+        $kept = Text::limitBytes($text, $max);
+        $full = max($fullSize ?? 0, strlen($text));
+        $cut = strlen($kept) < $full ? 'kept ' . BodyReader::formatBytes(strlen($kept)) . ' of ' . BodyReader::formatBytes($full) : null;
+        if ($cut !== null) {
+            $kept .= "\n…[cut: {$cut}]";
+        }
+        if ($note !== null) {
+            $cut = $cut !== null ? "{$cut}; {$note}" : $note;
+        }
+
+        return ['text' => $kept, 'redacted' => $redacted, 'cut' => $cut];
     }
 
     /**
      * @param mixed $response
+     * @return array{text: string, redacted: bool, cut: ?string}|null
      */
-    private function responseBody($response, int $max): ?string
+    private function responseBody($response, int $max): ?array
     {
         if (!$response instanceof Response || $response instanceof BinaryFileResponse || $response instanceof StreamedResponse) {
             return null;
@@ -187,27 +228,10 @@ class CaptureRequests
         if (!is_string($content) || $content === '') {
             return null;
         }
+        $read = Text::limitBytes($content, $max * 4);
+        $clean = $this->redactor->redactBody($read);
 
-        return Text::limitBytes($this->redactor->redactBody(Text::limitBytes($content, $max * 4)), $max);
-    }
-
-    /**
-     * @param Request $request
-     * @return array<string, string>
-     */
-    private function headers($request): array
-    {
-        $sensitive = array_map('strtolower', (array) $this->recorder->setting('redact.headers', []));
-        $out = [];
-        foreach ($request->headers->all() as $name => $values) {
-            $name = strtolower((string) $name);
-            $value = is_array($values) ? implode(', ', $values) : (string) $values;
-            $out[$name] = in_array($name, $sensitive, true)
-                ? (string) $this->recorder->setting('redact.replacement', '[REDACTED]')
-                : Text::limit($this->redactor->redactString($value), 500);
-        }
-
-        return $out;
+        return $this->bounded($clean, $max, Recorder::masked($read, $clean), null, strlen($content));
     }
 
     /**

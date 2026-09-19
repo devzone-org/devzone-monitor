@@ -191,6 +191,259 @@ final class RecorderTest extends TestCase
         $this->assertSame(1070.0, $request['outgoing_ms']);
     }
 
+    public function testOutgoingHeadersAreSentForEveryCallWithSecretsMasked(): void
+    {
+        $recorder = $this->recorder(['redact' => ['headers' => ['authorization', 'cookie', 'set-cookie'], 'replacement' => '[REDACTED]']]);
+        $execution = $recorder->startRequest();
+        $recorder->recordOutgoing([
+            'method' => 'GET',
+            'url' => 'https://api.bank.example/rates',
+            'status' => 200,
+            'ms' => 80.0,
+            'request_headers' => ['Authorization' => ['Bearer abc123'], 'Accept' => ['application/json'], 'X-Request-Id' => ['r-1']],
+            'response_headers' => ['Content-Type' => ['application/json'], 'Set-Cookie' => ['session=xyz', 'b=2']],
+        ]);
+        $recorder->finishRequest($execution, ['status' => 200]);
+
+        $call = $this->sink->records('outgoing')[0];
+        $this->assertSame(['authorization' => '[REDACTED]', 'accept' => 'application/json', 'x-request-id' => 'r-1'], $call['request_headers']);
+        $this->assertSame(['content-type' => 'application/json', 'set-cookie' => '[REDACTED]'], $call['response_headers']);
+        $this->assertArrayNotHasKey('response_body', $call);
+    }
+
+    public function testOutgoingHeadersCanBeTurnedOff(): void
+    {
+        $recorder = $this->recorder(['outgoing.headers' => false]);
+        $execution = $recorder->startRequest();
+        $recorder->recordOutgoing(['method' => 'GET', 'url' => 'https://api.bank.example/rates', 'status' => 200, 'request_headers' => ['Accept' => 'json']]);
+        $recorder->finishRequest($execution, ['status' => 200]);
+
+        $this->assertArrayNotHasKey('request_headers', $this->sink->records('outgoing')[0]);
+    }
+
+    public function testOutgoingBodyModes(): void
+    {
+        $ok = ['method' => 'POST', 'url' => 'https://api.bank.example/verify', 'status' => 200, 'request_body' => '{"a":1}', 'response_body' => '{"ok":true}'];
+        $failed = ['status' => 502] + $ok;
+
+        foreach ([
+            'errors' => [false, true],
+            'always' => [true, true],
+            'never' => [false, false],
+        ] as $mode => [$okKept, $failedKept]) {
+            $recorder = $this->recorder(['outgoing.bodies' => $mode]);
+            $execution = $recorder->startRequest();
+            $recorder->recordOutgoing($ok);
+            $recorder->recordOutgoing($failed);
+            $recorder->finishRequest($execution, ['status' => 200]);
+            [$first, $second] = $this->sink->records('outgoing');
+
+            $this->assertSame($okKept, isset($first['response_body']), "{$mode}: successful call");
+            $this->assertSame($failedKept, isset($second['response_body']), "{$mode}: failed call");
+            $this->assertSame($okKept, $recorder->keepsOutgoingBodies(false));
+        }
+
+        // The v2.0.0 flag still works when bodies is not set.
+        $this->assertFalse($this->recorder(['outgoing' => ['enabled' => true, 'bodies_on_error' => false]])->keepsOutgoingBodies(true));
+        $this->assertTrue($this->recorder(['outgoing' => ['enabled' => true, 'bodies_on_error' => true]])->keepsOutgoingBodies(true));
+    }
+
+    public function testALargeResponseBodyIsCutRedactedAndMarked(): void
+    {
+        $recorder = $this->recorder(['outgoing.bodies' => 'always']);
+        $execution = $recorder->startRequest();
+        $json = '{"card_number":"4111111111111111","rows":[' . implode(',', array_fill(0, 60000, '{"id":1,"name":"x"}')) . ']}';
+        $recorder->recordOutgoing([
+            'method' => 'GET', 'url' => 'https://api.bank.example/statement', 'status' => 200,
+            // What BodyReader hands over: the first 32 KB and the full size.
+            'response_body' => substr($json, 0, 32768), 'response_body_size' => strlen($json),
+            'request_body' => '{"from":"2026-09-01"}', 'request_body_size' => 21,
+        ]);
+        $recorder->finishRequest($execution, ['status' => 200]);
+
+        $call = $this->sink->records('outgoing')[0];
+        [$kept, $note] = explode("\n…", $call['response_body']);
+        $this->assertLessThanOrEqual(8192, strlen($kept));
+        $this->assertSame('[cut: kept 8 KB of 1.1 MB]', $note);
+        $this->assertStringNotContainsString('4111111111111111', $kept, 'redacted although the JSON no longer parses');
+        $this->assertSame('{"from":"2026-09-01"}', $call['request_body'], 'a small body is kept whole, unmarked');
+    }
+
+    public function testNotesFromTheBodyReaderPassThrough(): void
+    {
+        $recorder = $this->recorder(['outgoing.bodies' => 'always']);
+        $execution = $recorder->startRequest();
+        $recorder->recordOutgoing(['method' => 'GET', 'url' => 'https://files.example/a.pdf', 'status' => 200, 'response_body' => '[application/pdf body not kept, 3 MB]', 'response_body_size' => 3145728]);
+        $recorder->finishRequest($execution, ['status' => 200]);
+
+        $this->assertSame('[application/pdf body not kept, 3 MB]', $this->sink->records('outgoing')[0]['response_body']);
+    }
+
+    public function testAnOversizedCallKeepsItsHeadersAndShortensItsBodies(): void
+    {
+        $recorder = $this->recorder(['outgoing.bodies' => 'always', 'spool.max_record_bytes' => 32768]);
+        $execution = $recorder->startRequest();
+        // Quotes and newlines double in JSON: 8 KB each becomes ~16 KB each.
+        $escaped = str_repeat("\"\n", 4096);
+        $recorder->recordOutgoing([
+            'method' => 'POST', 'url' => 'https://api.bank.example/soap', 'status' => 500,
+            'request_headers' => ['Accept' => 'text/xml', 'X-Trace' => 'abc'],
+            'request_body' => $escaped, 'response_body' => $escaped,
+        ]);
+        $recorder->finishRequest($execution, ['status' => 200]);
+
+        $call = $this->sink->records('outgoing')[0];
+        $this->assertTrue($call['_truncated']);
+        $this->assertSame(['accept' => 'text/xml', 'x-trace' => 'abc'], $call['request_headers']);
+        $this->assertStringEndsWith('…[cut to fit the record size limit]', $call['response_body']);
+        $this->assertLessThan(3000, strlen($call['response_body']));
+    }
+
+    public function testHugeHeadersAreDroppedBeforeTheRecordIsLost(): void
+    {
+        $recorder = $this->recorder(['spool.max_record_bytes' => 32768]);
+        $execution = $recorder->startRequest();
+        $headers = [];
+        for ($i = 0; $i < 150; $i++) {
+            $headers["x-h{$i}"] = str_repeat('v', 900);
+        }
+        $recorder->recordOutgoing(['method' => 'GET', 'url' => 'https://api.example/x', 'status' => 200, 'ms' => 12.0, 'response_headers' => $headers]);
+        $recorder->finishRequest($execution, ['status' => 200]);
+
+        $line = $this->sink->records('outgoing')[0];
+        $this->assertArrayNotHasKey('response_headers', $line);
+        $this->assertSame('api.example', $line['host'], 'the call itself is still recorded');
+        $this->assertSame(12.0, $line['ms']);
+    }
+
+    private function queryRecorder(array $overrides = []): Recorder
+    {
+        return $this->recorder($overrides + [
+            'redact' => [
+                'replacement' => '[REDACTED]',
+                'keys' => ['password', 'token', 'secret', 'card', 'pin'],
+                'patterns' => ['card' => '/\b(?:\d[ -]?){15}\d\b/', 'email' => '/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/'],
+                'query_keys' => ['key', 'api_key', 'apikey', 'signature', 'otp'],
+                'headers' => ['authorization', 'cookie'],
+            ],
+        ]);
+    }
+
+    public function testRequestQueryParametersAreKeptMasked(): void
+    {
+        $recorder = $this->queryRecorder();
+        $params = [
+            'query' => 'asd',
+            'dsa' => 'ks',
+            'access_token' => 'eyJabc',
+            'api_key' => 'k-123',
+            'email' => 'ali@example.com',
+            'ids' => ['1', '2'],
+            'note' => 'card 4111 1111 1111 1111',
+        ];
+        $this->assertSame([
+            'query' => 'asd',
+            'dsa' => 'ks',
+            'access_token' => '[REDACTED]',
+            'api_key' => '[REDACTED]',
+            'email' => '[REDACTED]',
+            'ids' => '["1","2"]',
+            'note' => 'card [REDACTED]',
+        ], $recorder->queryParams($params));
+
+        $execution = $recorder->startRequest();
+        $recorder->finishRequest($execution, ['method' => 'GET', 'url' => 'https://app.test/debug-db', 'status' => 200, 'query' => $recorder->queryParams(['query' => 'asd', 'dsa' => 'ks'])]);
+        $request = $this->sink->records('request')[0];
+        $this->assertSame('https://app.test/debug-db', $request['url']);
+        $this->assertSame(['query' => 'asd', 'dsa' => 'ks'], $request['query']);
+    }
+
+    public function testAHugeQueryStringIsBounded(): void
+    {
+        $recorder = $this->queryRecorder();
+
+        // 40 KB in one value, then 200 parameters.
+        $params = ['blob' => str_repeat('x', 40000)];
+        for ($i = 0; $i < 200; $i++) {
+            $params["p{$i}"] = str_repeat('y', 100);
+        }
+        $out = $recorder->queryParams($params);
+
+        $this->assertSame(500, strlen($out['blob']));
+        $this->assertLessThanOrEqual(51, count($out));
+        $this->assertLessThanOrEqual(8192 + 100, strlen(implode('', array_keys($out)) . implode('', $out)));
+        $this->assertMatchesRegularExpression('/^\[\d+ more parameters not kept\]$/', $out['…']);
+    }
+
+    public function testOutgoingCallsCarryTheirQueryParameters(): void
+    {
+        $recorder = $this->queryRecorder();
+        $execution = $recorder->startRequest();
+        $recorder->recordOutgoing(['method' => 'GET', 'url' => 'https://api.bank.example/rates?from=USD&to=PKR&apikey=s3cr3t', 'status' => 200]);
+        $recorder->recordOutgoing(['method' => 'GET', 'url' => 'https://api.bank.example/rates', 'status' => 200]);
+        $recorder->finishRequest($execution, ['status' => 200]);
+
+        [$with, $without] = $this->sink->records('outgoing');
+        $this->assertSame('/rates', $with['path']);
+        $this->assertSame(['from' => 'USD', 'to' => 'PKR', 'apikey' => '[REDACTED]'], $with['query']);
+        $this->assertArrayNotHasKey('query', $without);
+    }
+
+    public function testMaskedAndCutFieldsAreTagged(): void
+    {
+        $recorder = $this->queryRecorder(['outgoing.bodies' => 'always']);
+        $execution = $recorder->startRequest();
+        $recorder->recordOutgoing([
+            'method' => 'POST', 'url' => 'https://api.bank.example/pay?apikey=s&from=USD', 'status' => 200,
+            'request_headers' => ['Authorization' => 'Bearer x', 'Accept' => 'json'],
+            'response_headers' => ['Content-Type' => 'json'],
+            'request_body' => '{"card_number":"4111111111111111","amount":5}',
+            'response_body' => str_repeat('a', 40000), 'response_body_size' => 1048576,
+        ]);
+        $recorder->finishRequest($execution, ['status' => 200]);
+
+        $call = $this->sink->records('outgoing')[0];
+        $this->assertEqualsCanonicalizing(['query', 'request_headers', 'request_body'], $call['_redacted']);
+        $this->assertSame(['response_body' => 'kept 8 KB of 1 MB'], $call['_cut']);
+    }
+
+    public function testCleanFieldsCarryNoTags(): void
+    {
+        $recorder = $this->queryRecorder(['outgoing.bodies' => 'always']);
+        $execution = $recorder->startRequest();
+        $recorder->recordOutgoing(['method' => 'GET', 'url' => 'https://api.example/rates?from=USD', 'status' => 200, 'request_headers' => ['Accept' => 'json'], 'response_body' => '{"rate":1}']);
+        $recorder->finishRequest($execution, ['status' => 200]);
+
+        $call = $this->sink->records('outgoing')[0];
+        $this->assertArrayNotHasKey('_redacted', $call);
+        $this->assertArrayNotHasKey('_cut', $call);
+    }
+
+    public function testLogTagsSayWhatWasMaskedOrCut(): void
+    {
+        $recorder = $this->recorder(['logs.level' => 'info']);
+        $recorder->recordLog('error', 'Charge failed for ali@example.com ' . str_repeat('x', 5000), ['password' => 'p', 'order' => 7]);
+        $recorder->recordLog('info', 'All good', ['order' => 7]);
+
+        [$masked, $clean] = $this->sink->records('log');
+        $this->assertEqualsCanonicalizing(['message', 'context'], $masked['_redacted']);
+        $this->assertMatchesRegularExpression('/^kept [\d,]+ of 5,0\d\d characters$/', $masked['_cut']['message']);
+        $this->assertArrayNotHasKey('_redacted', $clean);
+        $this->assertArrayNotHasKey('_cut', $clean);
+    }
+
+    public function testRecordsShrunkToFitSayWhatWasDropped(): void
+    {
+        $recorder = $this->recorder(['outgoing.bodies' => 'always', 'spool.max_record_bytes' => 32768]);
+        $execution = $recorder->startRequest();
+        $escaped = str_repeat("\"\n", 4096);
+        $recorder->recordOutgoing(['method' => 'POST', 'url' => 'https://api.example/soap', 'status' => 500, 'request_body' => $escaped, 'response_body' => $escaped]);
+        $recorder->finishRequest($execution, ['status' => 200]);
+
+        $call = $this->sink->records('outgoing')[0];
+        $this->assertSame('shortened to 2 KB to fit the 32 KB record limit', $call['_cut']['response_body']);
+    }
+
     public function testLogsFollowTheirOwnLevelAndCarryTheTrace(): void
     {
         $recorder = $this->recorder(['logs.level' => 'info']);

@@ -55,10 +55,16 @@ return [
         // Paths never recorded ($request->is() patterns).
         'ignore_paths' => ['telescope*', 'horizon*', '_debugbar*', 'up'],
 
+        // Headers and redacted bodies of a request are kept when one of these
+        // matches; query parameters are kept for every request.
         'bodies' => [
-            'on_status' => 500,   // capture when status >= this; null to disable
-            'slow_ms' => null,    // also capture when slower than this; null to disable
-            'routes' => [],       // route names or URI patterns always captured
+            // status >= this; null to disable
+            'on_status' => env('LOG_MONITOR_REQUEST_BODIES_ON_STATUS', 500),
+            // slower than this many ms; null to disable
+            'slow_ms' => env('LOG_MONITOR_REQUEST_BODIES_SLOW_MS'),
+            // route names or URI patterns always kept, e.g. webhooks:
+            // LOG_MONITOR_REQUEST_BODIES_ROUTES="integrations/*,webhooks/*"
+            'routes' => array_values(array_filter(array_map('trim', explode(',', (string) env('LOG_MONITOR_REQUEST_BODIES_ROUTES', ''))))),
             'max_bytes' => 8192,
         ],
     ],
@@ -98,8 +104,14 @@ return [
     */
     'outgoing' => [
         'enabled' => true,
-        'bodies_on_error' => true,    // keep redacted bodies when status >= 400 or the call fails
-        'max_bytes' => 8192,
+        // Redacted request and response bodies: errors (status >= 400 or the
+        // call failed), always, or never. "always" stores successful bank
+        // and payment responses too; switch it on while debugging.
+        'bodies' => env('LOG_MONITOR_OUTGOING_BODIES', 'errors'),
+        // Request and response headers of every call; the names listed in
+        // redact.headers (Authorization, Cookie, ...) are masked.
+        'headers' => (bool) env('LOG_MONITOR_OUTGOING_HEADERS', true),
+        'max_bytes' => 8192,          // kept per body after redaction; 4x this is read at most
         'max_per_request' => 500,
     ],
 
@@ -222,6 +234,9 @@ return [
         'sql_bindings' => true,
         'trace_arguments' => true,
         'headers' => ['authorization', 'cookie', 'set-cookie', 'x-xsrf-token', 'x-csrf-token', 'proxy-authorization'],
+        // Query parameters: the keys above plus names that usually carry a
+        // secret in a URL.
+        'query_keys' => ['key', 'api_key', 'apikey', 'access_token', 'signature', 'sig', 'otp', 'code', 'hash'],
     ],
 
 ];

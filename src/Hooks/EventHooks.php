@@ -2,6 +2,7 @@
 
 namespace DevZone\LogMonitor\Hooks;
 
+use DevZone\LogMonitor\Capture\BodyReader;
 use DevZone\LogMonitor\Capture\Recorder;
 use DevZone\LogMonitor\Support\Report;
 use Illuminate\Contracts\Events\Dispatcher;
@@ -150,10 +151,13 @@ class EventHooks
                 'request_bytes' => isset($stats['size_upload']) ? (int) $stats['size_upload'] : null,
                 'response_bytes' => isset($stats['size_download']) ? (int) $stats['size_download'] : $this->headerLength($response),
             ];
-            if ($failed) {
-                // Bodies are read only for failed calls.
-                $call['request_body'] = (string) $request->body();
-                $call['response_body'] = (string) $response->body();
+            if ($this->recorder->setting('outgoing.headers', true)) {
+                $call['request_headers'] = method_exists($request, 'headers') ? (array) $request->headers() : [];
+                $call['response_headers'] = method_exists($response, 'headers') ? (array) $response->headers() : [];
+            }
+            if ($this->recorder->keepsOutgoingBodies($failed)) {
+                // Read only when kept, and only the first few KB: see BodyReader.
+                $call += $this->bodies(['request' => $request, 'response' => $response]);
             }
             $this->recorder->recordOutgoing($call);
         } catch (\Throwable $e) {
@@ -175,11 +179,35 @@ class EventHooks
                 'status' => null,
                 'ms' => $start !== null ? (microtime(true) - $start) * 1000 : null,
                 'error' => 'connection failed',
-                'request_body' => (string) $request->body(),
-            ]);
+                'request_headers' => $this->recorder->setting('outgoing.headers', true) && method_exists($request, 'headers')
+                    ? (array) $request->headers()
+                    : null,
+            ] + ($this->recorder->keepsOutgoingBodies(true) ? $this->bodies(['request' => $request]) : []));
         } catch (\Throwable $e) {
             Report::error('outgoing listener failed', $e);
         }
+    }
+
+    /**
+     * request_body / response_body (+ _size) for the messages given, read
+     * with a cap well under memory: redaction headroom of 4x what is kept.
+     *
+     * @param array<string, mixed> $messages
+     * @return array<string, mixed>
+     */
+    private function bodies(array $messages): array
+    {
+        $limit = 4 * max(256, (int) $this->recorder->setting('outgoing.max_bytes', 8192));
+        $out = [];
+        foreach ($messages as $side => $message) {
+            $read = BodyReader::read($message, $limit);
+            if ($read !== null) {
+                $out[$side . '_body'] = $read['body'];
+                $out[$side . '_body_size'] = $read['size'];
+            }
+        }
+
+        return $out;
     }
 
     public function onJobProcessing($event): void
