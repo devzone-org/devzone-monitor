@@ -23,12 +23,12 @@ use Illuminate\Support\ServiceProvider;
 
 class LogMonitorServiceProvider extends ServiceProvider
 {
-    const VERSION = '2.0.0';
+    const VERSION = '2.0.4';
     const CONFIG_PATH = __DIR__ . '/../config/log-monitor.php';
 
     public function register(): void
     {
-        $this->mergeConfigFrom(self::CONFIG_PATH, 'log-monitor');
+        $this->mergeConfigDeep(self::CONFIG_PATH, 'log-monitor');
 
         $this->app->singleton(Redactor::class, function ($app) {
             $redact = $app['config']->get('log-monitor.redact', []);
@@ -73,6 +73,52 @@ class LogMonitorServiceProvider extends ServiceProvider
                 ]
             );
         });
+    }
+
+    /**
+     * Like mergeConfigFrom(), but nested: an app that published the config
+     * from an older version still gets settings added since (for example
+     * outgoing.bodies and LOG_MONITOR_OUTGOING_BODIES). Anything the app's
+     * file sets still wins.
+     */
+    private function mergeConfigDeep(string $path, string $key): void
+    {
+        if (method_exists($this->app, 'configurationIsCached') && $this->app->configurationIsCached()) {
+            return;
+        }
+        $config = $this->app->make('config');
+        $published = $config->get($key, []);
+        $config->set($key, self::mergeDefaults(require $path, is_array($published) ? $published : []));
+    }
+
+    /**
+     * Package defaults overlaid with the app's values: nested settings merge
+     * key by key, lists (redact.keys, routes...) are replaced whole.
+     *
+     * @param array<mixed> $defaults
+     * @param array<mixed> $app
+     * @return array<mixed>
+     */
+    public static function mergeDefaults(array $defaults, array $app): array
+    {
+        foreach ($app as $name => $value) {
+            if (is_array($value) && isset($defaults[$name]) && is_array($defaults[$name])
+                && self::isMap($value) && self::isMap($defaults[$name])) {
+                $defaults[$name] = self::mergeDefaults($defaults[$name], $value);
+            } else {
+                $defaults[$name] = $value;
+            }
+        }
+
+        return $defaults;
+    }
+
+    /**
+     * @param array<mixed> $value
+     */
+    private static function isMap(array $value): bool
+    {
+        return $value !== [] && array_keys($value) !== range(0, count($value) - 1);
     }
 
     public function boot(): void
