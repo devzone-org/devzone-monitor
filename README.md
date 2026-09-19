@@ -5,7 +5,7 @@ monitoring server: web requests, database queries, outgoing HTTP calls,
 queued jobs, logs and exceptions. Everything is redacted on the server it
 happens on, held in a small on-disk spool, and sent once a minute.
 
-- Laravel 7, 8, 9, 10 and 11 (outgoing HTTP capture needs Laravel 8+)
+- Laravel 7 to 13 (outgoing HTTP capture needs Laravel 8+)
 - PHP 7.3+ and 8.x
 - **Off by default.** Installing or deploying does nothing until
   `LOG_MONITOR_ENABLED=true`
