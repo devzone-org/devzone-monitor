@@ -203,7 +203,11 @@ class EventHooks
         foreach ($messages as $side => $message) {
             $read = BodyReader::read($message, $limit);
             if ($read !== null) {
-                $out[$side . '_body'] = $read['body'];
+                if ($read['body'] !== null) {
+                    $out[$side . '_body'] = $read['body'];
+                } else {
+                    $out[$side . '_body_note'] = $read['note'];
+                }
                 $out[$side . '_body_size'] = $read['size'];
                 $out[$side . '_body_type'] = $read['type'] ?? null;
             }

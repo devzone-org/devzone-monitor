@@ -24,7 +24,7 @@ use Illuminate\Support\ServiceProvider;
 class LogMonitorServiceProvider extends ServiceProvider
 {
     /** Fallback when Composer's runtime API cannot tell (see version()). */
-    const VERSION = '2.1.0';
+    const VERSION = '2.1.2';
     const PACKAGE = 'devzone/log-monitor';
     const CONFIG_PATH = __DIR__ . '/../config/log-monitor.php';
 

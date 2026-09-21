@@ -106,6 +106,10 @@ final class BodySanitizer
                     return $this->note('json body', $size, 'could not be parsed');
                 }
                 if (!is_array($decoded)) {
+                    // A bare string or number has no key an allowlist could approve.
+                    if ($onlyFields !== []) {
+                        return $this->note('json body', $size, 'no fields to match only_fields');
+                    }
                     $clean = is_string($decoded) ? $this->redactor->redactString($decoded) : $decoded;
 
                     return $this->bounded((string) self::json($clean), $maxBytes, $clean !== $decoded);
@@ -124,6 +128,9 @@ final class BodySanitizer
                 return $this->xml($body, $size, $maxBytes, $onlyFields);
             }
 
+            if ($onlyFields !== []) {
+                return $this->note('text body', $size, 'no fields to match only_fields');
+            }
             $clean = $this->redactor->redactString($body);
 
             return $this->bounded($clean, $maxBytes, $clean !== $body);
@@ -142,6 +149,12 @@ final class BodySanitizer
      */
     public function structured(array $data, int $maxBytes, array $onlyFields = [], ?string $note = null, string $what = 'body', ?int $size = null): array
     {
+        // Already-parsed input gets the same byte limit as a raw body, checked
+        // before any masking work is done on it.
+        $bytes = self::sizeOf($data, $this->maxParseBytes, 0);
+        if ($bytes > $this->maxParseBytes) {
+            return $this->note($what, $size, 'over the ' . BodyReader::formatBytes($this->maxParseBytes) . ' parse limit');
+        }
         try {
             $clean = $this->redactor->redactBounded($data, $this->maxValues);
         } catch (\OverflowException $e) {
@@ -295,6 +308,34 @@ final class BodySanitizer
         }
 
         return 'text';
+    }
+
+    /**
+     * Rough size of parsed input (keys and scalar values), counting stops
+     * as soon as it passes $limit.
+     *
+     * @param mixed $value
+     */
+    private static function sizeOf($value, int $limit, int $depth): int
+    {
+        if (is_string($value)) {
+            return strlen($value);
+        }
+        if (!is_array($value)) {
+            return is_scalar($value) ? 8 : 0;
+        }
+        if ($depth > Redactor::MAX_DEPTH) {
+            return 0;
+        }
+        $total = 2;
+        foreach ($value as $key => $item) {
+            $total += strlen((string) $key) + 4 + self::sizeOf($item, $limit - $total, $depth + 1);
+            if ($total > $limit) {
+                return $total;
+            }
+        }
+
+        return $total;
     }
 
     /**

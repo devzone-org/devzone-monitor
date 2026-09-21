@@ -159,6 +159,9 @@ return [
         'enabled' => true,
         'level' => env('LOG_MONITOR_LOG_LEVEL', 'warning'),
         'max_per_request' => 200,
+        // Log message text (masked). false keeps level, time, trace and a
+        // fingerprint of where the log call is, but no text.
+        'messages' => true,
         // The context array passed with each log call, masked by key.
         'context' => true,
     ],
@@ -167,7 +170,8 @@ return [
         'enabled' => true,
         'max_frames' => 50,
         // Exception messages (masked). false keeps class, file, line and
-        // frames only: for apps whose exceptions quote user input.
+        // frames only: for apps whose exceptions quote user input. Also
+        // hides the log line Laravel writes with the same message.
         'messages' => true,
     ],
 
@@ -290,6 +294,13 @@ return [
         'headers' => [],
         // Regexes run on URL paths; matches become {token}.
         'path_patterns' => [],
+        // Per-host rules for outgoing URLs ("api.x.com" or "*.x.com"):
+        //   ['path' => 'omit']                      no path and no query kept
+        //   ['path_patterns' => ['#(?<=/keys/)[^/]+#']]  matches become {token}
+        // Built in: hooks.slack.com, hooks.zapier.com and Office 365 webhooks
+        // are omitted. Add a rule for every API that puts a credential in
+        // its URL path; generic token detection is best effort.
+        'hosts' => [],
         'sql_bindings' => true,
         'trace_arguments' => true,
         'body_formats' => ['json', 'form', 'xml'],

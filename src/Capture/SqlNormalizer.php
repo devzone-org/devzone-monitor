@@ -60,12 +60,13 @@ final class SqlNormalizer
 
         // Anything that opens a literal or comment and survived was never
         // closed: the statement was cut or is not SQL we understand.
+        // A leftover */ means comments were not paired the way we read them.
         $stray = [
-            'mysql' => '/[\'"`]|\/\*/',
-            'other' => '/[\'"`]|\/\*|(?<![\w$])\$(?:[A-Za-z_]\w*)?\$/',
-            'pgsql' => '/[\'"]|\/\*|(?<![\w$])\$(?:[A-Za-z_]\w*)?\$/',
-            'sqlite' => '/[\'"`]|\/\*/',
-            'sqlsrv' => '/[\'"]|\/\*/',
+            'mysql' => '/[\'"`]|\/\*|\*\//',
+            'other' => '/[\'"`]|\/\*|\*\/|(?<![\w$])\$(?:[A-Za-z_]\w*)?\$/',
+            'pgsql' => '/[\'"]|\/\*|\*\/|(?<![\w$])\$(?:[A-Za-z_]\w*)?\$/',
+            'sqlite' => '/[\'"`]|\/\*|\*\//',
+            'sqlsrv' => '/[\'"]|\/\*|\*\//',
         ][$driver];
         if (preg_match($stray, $out) === 1) {
             return self::UNPARSED;
@@ -136,9 +137,14 @@ final class SqlNormalizer
         $backslashSingle = "'(?:[^'\\\\]++|\\\\.|'')*+'";
         $standardSingle = "'(?:[^']++|'')*+'";
 
+        // Block comments nest in PostgreSQL (/* a /* b */ c */ is one
+        // comment); unknown drivers get the same reading, which removes more.
+        $block = $driver === 'pgsql' || $driver === 'other'
+            ? '(?<nested>\/\*(?:[^\/*]++|\/(?!\*)|\*(?!\/)|(?&nested))*+\*\/)'
+            : '\/\*.*?\*\/';
         $parts = [
             // Comments. MySQL also uses # to end of line; so may an unknown driver.
-            '(?<comment>--[^\r\n]*+|\/\*.*?\*\/' . ($driver === 'mysql' || $driver === 'other' ? '|#[^\r\n]*+' : '') . ')',
+            '(?<comment>--[^\r\n]*+|' . $block . ($driver === 'mysql' || $driver === 'other' ? '|#[^\r\n]*+' : '') . ')',
         ];
 
         if ($driver === 'mysql' || $driver === 'other') {
@@ -158,7 +164,9 @@ final class SqlNormalizer
             'mysql' => ['`(?:[^`]++|``)*+`'],
             'other' => ['`(?:[^`]++|``)*+`'],
             'pgsql' => ['"(?:[^"]++|"")*+"'],
-            'sqlite' => ['"(?:[^"]++|"")*+"', '`(?:[^`]++|``)*+`', '\[[^\]\r\n]*+\]'],
+            // SQLite reads "x" as a string when no column x exists, so
+            // double quotes are masked below; only `x` and [x] are kept.
+            'sqlite' => ['`(?:[^`]++|``)*+`', '\[[^\]\r\n]*+\]'],
             'sqlsrv' => ['"(?:[^"]++|"")*+"', '\[[^\]\r\n]*+\]'],
         ];
         $parts[] = '(?<keep>' . implode('|', $identifiers[$driver]) . ')';
@@ -167,6 +175,8 @@ final class SqlNormalizer
             // Double quotes are strings in MySQL. For unknown drivers a
             // quoted identifier masked by mistake only costs readability.
             $parts[] = '(?<dstr>"(?:[^"\\\\]++|\\\\.|"")*+")';
+        } elseif ($driver === 'sqlite') {
+            $parts[] = '(?<dstr>"(?:[^"]++|"")*+")';
         }
 
         // Numbers not part of an identifier or a $1 placeholder.

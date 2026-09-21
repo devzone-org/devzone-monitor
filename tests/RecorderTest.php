@@ -328,7 +328,7 @@ final class RecorderTest extends TestCase
     {
         $recorder = $this->recorder(['outgoing.bodies' => 'always']);
         $execution = $recorder->startRequest();
-        $recorder->recordOutgoing(['method' => 'GET', 'url' => 'https://files.example/a.pdf', 'status' => 200, 'response_body' => '[application/pdf body not kept, 3 MB]', 'response_body_size' => 3145728]);
+        $recorder->recordOutgoing(['method' => 'GET', 'url' => 'https://files.example/a.pdf', 'status' => 200, 'response_body_note' => '[application/pdf body not kept, 3 MB]', 'response_body_size' => 3145728]);
         $recorder->finishRequest($execution, ['status' => 200]);
 
         $this->assertSame('[application/pdf body not kept, 3 MB]', $this->sink->records('outgoing')[0]['response_body']);

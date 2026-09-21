@@ -82,6 +82,21 @@ final class Redactor
         'activation', 'magic', 'magic-link', 'login', 'unsubscribe', 'share', 'shared', 'download', 'auth',
     ];
 
+    /**
+     * Per-host path rules for outgoing URLs, matched by exact host or
+     * "*.suffix": 'path' => 'omit' stores no path or query at all;
+     * 'path_patterns' => [regex, ...] replaces matches with {token}.
+     * Services that put the credential itself in the path are omitted.
+     */
+    const DEFAULT_HOSTS = [
+        'hooks.slack.com' => ['path' => 'omit'],
+        'hooks.zapier.com' => ['path' => 'omit'],
+        'outlook.office.com' => ['path' => 'omit'],
+        '*.webhook.office.com' => ['path' => 'omit'],
+    ];
+
+    const PATH_NOT_KEPT = '[path not kept]';
+
     /** Nesting deeper than this is replaced wholesale rather than walked. */
     const MAX_DEPTH = 32;
 
@@ -113,6 +128,9 @@ final class Redactor
     /** @var array<int, string> */
     private $pathPatterns = [];
 
+    /** @var array<string, array{omit: bool, patterns: array<int, string>}> */
+    private $hosts = [];
+
     /** @var string */
     private $replacement;
 
@@ -137,6 +155,7 @@ final class Redactor
      * @param array<int, string> $secretNames
      * @param array<int, string> $headers
      * @param array<int, string> $pathPatterns
+     * @param array<string, array<string, mixed>> $hosts
      */
     public function __construct(
         array $keys = self::DEFAULT_KEYS,
@@ -146,7 +165,8 @@ final class Redactor
         bool $stripTraceArguments = true,
         array $secretNames = self::DEFAULT_SECRET_NAMES,
         array $headers = self::DEFAULT_HEADERS,
-        array $pathPatterns = self::DEFAULT_PATH_PATTERNS
+        array $pathPatterns = self::DEFAULT_PATH_PATTERNS,
+        array $hosts = self::DEFAULT_HOSTS
     ) {
         $this->replacement = $replacement;
         $this->stripSqlBindings = $stripSqlBindings;
@@ -169,6 +189,15 @@ final class Redactor
         }
         $this->patterns = self::validPatterns($patterns);
         $this->pathPatterns = self::validPatterns($pathPatterns);
+        foreach ($hosts as $host => $rule) {
+            if (!is_string($host) || trim($host) === '' || !is_array($rule)) {
+                continue;
+            }
+            $this->hosts[strtolower(trim($host))] = [
+                'omit' => ($rule['path'] ?? null) === 'omit',
+                'patterns' => self::validPatterns(isset($rule['path_patterns']) && is_array($rule['path_patterns']) ? $rule['path_patterns'] : []),
+            ];
+        }
     }
 
     /**
@@ -201,7 +230,8 @@ final class Redactor
             !isset($config['trace_arguments']) || (bool) $config['trace_arguments'],
             array_merge(self::DEFAULT_SECRET_NAMES, $list('query_keys')),
             array_merge(self::DEFAULT_HEADERS, $list('headers')),
-            array_merge(self::DEFAULT_PATH_PATTERNS, $list('path_patterns'))
+            array_merge(self::DEFAULT_PATH_PATTERNS, $list('path_patterns')),
+            array_merge(self::DEFAULT_HOSTS, $list('hosts'))
         );
     }
 
@@ -302,9 +332,44 @@ final class Redactor
         if ($at !== false) {
             $authority = $this->replacement . '@' . substr($authority, $at + 1);
         }
+        $host = preg_replace('/:\d+$/', '', $at !== false ? substr($m[2], $at + 1) : $m[2]);
+        if ($this->omitsPath((string) $host)) {
+            return $m[1] . $authority . '/' . self::PATH_NOT_KEPT;
+        }
         $query = isset($m[4]) && $m[4] !== '' ? '?' . $this->redactQueryString($m[4]) : '';
 
-        return $m[1] . $authority . $this->redactPath($m[3]) . $query;
+        return $m[1] . $authority . $this->redactPath($m[3], (string) $host) . $query;
+    }
+
+    /**
+     * Whether a host's rule says to store no path (nor query) at all.
+     */
+    public function omitsPath(?string $host): bool
+    {
+        $rule = $this->hostRule($host);
+
+        return $rule !== null && $rule['omit'];
+    }
+
+    /**
+     * @return array{omit: bool, patterns: array<int, string>}|null
+     */
+    private function hostRule(?string $host): ?array
+    {
+        if ($host === null || $host === '' || $this->hosts === []) {
+            return null;
+        }
+        $host = strtolower($host);
+        if (isset($this->hosts[$host])) {
+            return $this->hosts[$host];
+        }
+        foreach ($this->hosts as $pattern => $rule) {
+            if (strpos($pattern, '*.') === 0 && substr($host, -(strlen($pattern) - 1)) === substr($pattern, 1)) {
+                return $rule;
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -312,10 +377,14 @@ final class Redactor
      * URLs, API keys in paths) with {token}. Route parameters ({id}) and
      * ordinary words and ids stay.
      */
-    public function redactPath(string $path): string
+    public function redactPath(string $path, ?string $host = null): string
     {
         if ($path === '' || $path === '/') {
             return $path;
+        }
+        $rule = $this->hostRule($host);
+        if ($rule !== null && $rule['omit']) {
+            return '/' . self::PATH_NOT_KEPT;
         }
 
         $segments = explode('/', $path);
@@ -342,7 +411,7 @@ final class Redactor
         }
         $path = implode('/', $segments);
 
-        foreach ($this->pathPatterns as $pattern) {
+        foreach (array_merge($this->pathPatterns, $rule !== null ? $rule['patterns'] : []) as $pattern) {
             $replaced = @preg_replace($pattern, '{token}', $path);
             if (is_string($replaced)) {
                 $path = $replaced;
@@ -671,8 +740,17 @@ final class Redactor
     public static function looksLikeToken(string $segment): bool
     {
         $length = strlen($segment);
+        // id:secret, as in /bot123456:AAH-xyz.../sendMessage
+        if (preg_match('/^[^:\/]*:[A-Za-z0-9_\-.~]{12,}$/', $segment) === 1) {
+            return true;
+        }
         if ($length < 16) {
             return false;
+        }
+        // Random letters: many capitals scattered through, unlike camelCase words.
+        if ($length >= 20 && preg_match('/^[A-Za-z_\-]+$/', $segment) === 1
+            && preg_match_all('/[A-Z]/', $segment) >= 0.3 * $length && preg_match('/[a-z]/', $segment) === 1) {
+            return true;
         }
         if (preg_match('/^eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+/', $segment) === 1) {
             return true;

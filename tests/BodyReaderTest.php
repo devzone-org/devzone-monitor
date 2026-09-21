@@ -41,7 +41,8 @@ final class BodyReaderTest extends TestCase
         $stream = new NoSeekStream(Utils::streamFor(str_repeat('x', 5000)));
         $read = BodyReader::read(new PsrResponse(200, ['Content-Type' => 'text/csv'], $stream), 100);
 
-        $this->assertSame('[streamed body not kept, 4.9 KB]', $read['body']);
+        $this->assertSame('[streamed body not kept, 4.9 KB]', $read['note']);
+        $this->assertNull($read['body']);
         $this->assertSame(0, $stream->tell(), 'nothing was consumed');
         $this->assertSame(5000, strlen($stream->getContents()));
     }
@@ -49,13 +50,13 @@ final class BodyReaderTest extends TestCase
     public function testBinaryBodiesAreNotedNotKept(): void
     {
         $pdf = BodyReader::read(new PsrResponse(200, ['Content-Type' => 'application/pdf; charset=binary'], str_repeat('%', 3 * 1048576)), 100);
-        $this->assertSame('[application/pdf body not kept, 3 MB]', $pdf['body']);
+        $this->assertSame('[application/pdf body not kept, 3 MB]', $pdf['note']);
 
         $untyped = BodyReader::read(new PsrResponse(200, [], "PK\x03\x04\0\0zip"), 100);
-        $this->assertSame('[binary body not kept, 9 B]', $untyped['body']);
+        $this->assertSame('[binary body not kept, 9 B]', $untyped['note']);
 
         $upload = new Request(new PsrRequest('POST', 'https://api.example/upload', ['Content-Type' => 'multipart/form-data; boundary=x'], '--x...'));
-        $this->assertSame('[multipart/form-data body not kept, 6 B]', BodyReader::read($upload, 100)['body']);
+        $this->assertSame('[multipart/form-data body not kept, 6 B]', BodyReader::read($upload, 100)['note']);
     }
 
     public function testEmptyBodiesGiveNothing(): void
@@ -86,11 +87,20 @@ final class BodyReaderTest extends TestCase
         $this->assertSame(3, $inner->tell());
     }
 
+    public function testAnOddContentTypeCannotWriteIntoTheNote(): void
+    {
+        $response = new PsrResponse(200, ['Content-Type' => 'image/png;password=hunter2'], "\x89PNG");
+        $this->assertSame('[image/png body not kept, 4 B]', BodyReader::read($response, 100)['note']);
+
+        $response = new PsrResponse(200, ['Content-Type' => 'image/x SECRETWORD'], "\x89PNG");
+        $this->assertSame('[binary body not kept, 4 B]', BodyReader::read($response, 100)['note']);
+    }
+
     public function testRequestBodiesAreReadToo(): void
     {
         $request = new Request(new PsrRequest('POST', 'https://api.example/verify', ['Content-Type' => 'application/json'], '{"iban":"PK00"}'));
 
-        $this->assertSame(['body' => '{"iban":"PK00"}', 'size' => 15, 'type' => 'application/json'], BodyReader::read($request, 100));
+        $this->assertSame(['body' => '{"iban":"PK00"}', 'note' => null, 'size' => 15, 'type' => 'application/json'], BodyReader::read($request, 100));
         $this->assertSame('{"iban":"PK00"}', $request->body());
     }
 }

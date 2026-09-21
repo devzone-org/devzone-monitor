@@ -41,7 +41,9 @@ final class SqlNormalizerTest extends TestCase
             ['mysql', 'select `a` from t where b = "x" and c in ("y", \'z\') -- note', 'select `a` from t where b = ? and c in (...)'],
             ['mysql', "select 1 # note\nfrom t where a = _utf8mb4'x' and b = X'4C' and c = 0x1F", 'select ? from t where a = ? and b = ? and c = ?'],
             ['sqlsrv', "select * from [dbo].[t2] where x = N'y'", 'select * from [dbo].[t2] where x = ?'],
-            ['sqlite', 'select "a" from `t` where b = \'c\' /* note */', 'select "a" from `t` where b = ?'],
+            // SQLite may read "a" as a string, so it is masked.
+            ['sqlite', 'select "a" from `t` where b = \'c\' /* note */', 'select ? from `t` where b = ?'],
+            ['pgsql', 'select 1 /* outer /* nested */ still comment */ from t', 'select ? from t'],
         ];
         foreach ($cases as [$driver, $sql, $expected]) {
             $this->assertSame($expected, SqlNormalizer::normalize($sql, $driver), "{$driver}: {$sql}");
@@ -55,6 +57,8 @@ final class SqlNormalizerTest extends TestCase
             ['mysql', 'select * from t where a = "secret'],
             ['pgsql', 'select $$secret'],
             ['pgsql', 'select 1 /* secret'],
+            ['pgsql', 'select 1 /* a /* b */ secret'],
+            ['mysql', 'select 1 /* a /* b */ secret */'],
             ['', "select 'a''"],
         ] as [$driver, $sql]) {
             $this->assertSame(SqlNormalizer::UNPARSED, SqlNormalizer::normalize($sql, $driver), $sql);

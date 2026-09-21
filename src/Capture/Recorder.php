@@ -290,7 +290,7 @@ class Recorder
     public function recordJobFailure(array $meta, ?string $parent, ?\Throwable $exception): void
     {
         try {
-            if (!$this->setting('jobs.enabled', true)) {
+            if (!$this->setting('jobs.enabled', true) || $this->stopIfSwitchedOff()) {
                 return;
             }
             $record = [
@@ -379,6 +379,9 @@ class Recorder
     public function recordQuery(string $sql, float $ms, string $connection, string $driver = ''): void
     {
         try {
+            if ($this->stopIfSwitchedOff()) {
+                return;
+            }
             $execution = $this->current();
             if ($execution === null || !$execution->setting('queries.enabled', true)) {
                 return;
@@ -388,7 +391,7 @@ class Recorder
             $execution->queryMs += $ms;
 
             // Long statements are keyed by their hash so the key itself stays small.
-            $key = $connection . "\0" . (strlen($sql) > 512 ? 'md5:' . md5($sql) : $sql);
+            $key = $connection . "\0" . $driver . "\0" . (strlen($sql) > 512 ? 'md5:' . md5($sql) : $sql);
             if (!isset($execution->statements[$key])) {
                 // Memory caps: beyond them a new statement is only counted.
                 $keep = strlen($sql) <= SqlNormalizer::MAX_INPUT ? $sql : null;
@@ -456,6 +459,9 @@ class Recorder
     public function recordOutgoing(array $call): void
     {
         try {
+            if ($this->stopIfSwitchedOff()) {
+                return;
+            }
             $execution = $this->current();
             if ($execution === null || !$execution->setting('outgoing.enabled', true)) {
                 return;
@@ -485,7 +491,7 @@ class Recorder
                 'scheme' => $parts['scheme'] ?? null,
                 'host' => $parts['host'] ?? null,
                 'port' => $parts['port'] ?? null,
-                'path' => $this->redactor->redactPath((string) ($parts['path'] ?? '/')),
+                'path' => $this->redactor->redactPath((string) ($parts['path'] ?? '/'), $host),
                 'status' => $status,
                 'ms' => $ms !== null ? round($ms, 2) : null,
                 'request_bytes' => $call['request_bytes'] ?? null,
@@ -495,7 +501,7 @@ class Recorder
                 [$record['error'], $redacted, $cut] = $this->cleanText((string) $call['error'], 1000);
                 self::mark($record, 'error', $redacted, $cut);
             }
-            if (isset($parts['query']) && $parts['query'] !== '') {
+            if (isset($parts['query']) && $parts['query'] !== '' && !$this->redactor->omitsPath($host)) {
                 parse_str((string) $parts['query'], $params);
                 if ($params !== []) {
                     $record['query'] = $this->queryParams($params, $meta);
@@ -515,10 +521,16 @@ class Recorder
                 $only = (array) $execution->setting('outgoing.only_fields', []);
                 foreach (['request_body', 'response_body'] as $key) {
                     if (isset($call[$key]) && is_string($call[$key]) && $call[$key] !== '') {
+                        // Every body goes through the sanitizer, whatever it looks like.
                         $size = isset($call[$key . '_size']) && is_int($call[$key . '_size']) ? $call[$key . '_size'] : null;
                         $type = isset($call[$key . '_type']) && is_string($call[$key . '_type']) ? $call[$key . '_type'] : null;
-                        $record[$key] = $this->outgoingBody($call[$key], $type, $max, $size, $only, $meta);
-                        self::mark($record, $key, $meta['redacted'], $meta['cut']);
+                        $clean = $this->sanitizer->sanitize($call[$key], $type, $max, $size, $only);
+                        $record[$key] = $clean['text'];
+                        self::mark($record, $key, $clean['redacted'], $clean['cut']);
+                    } elseif (isset($call[$key . '_note']) && is_string($call[$key . '_note'])) {
+                        // A note BodyReader wrote about a body it did not read.
+                        $record[$key] = $call[$key . '_note'];
+                        self::mark($record, $key, false, trim($call[$key . '_note'], '[]'));
                     }
                 }
             }
@@ -538,7 +550,7 @@ class Recorder
     public function recordLog(string $level, $message, array $context): void
     {
         try {
-            if (!$this->setting('logs.enabled', true)) {
+            if (!$this->setting('logs.enabled', true) || $this->stopIfSwitchedOff()) {
                 return;
             }
             $execution = $this->current();
@@ -560,6 +572,19 @@ class Recorder
             }
 
             [$text, $redacted, $cut] = $this->cleanText($this->stringify($message), self::MESSAGE_MAX);
+            $fingerprint = Fingerprint::log($level, $text);
+            // One policy for a message wherever it appears: Laravel logs an
+            // exception with its message as the log text, so hiding
+            // exception messages hides that copy too. logs.messages hides
+            // every log message.
+            if (!$this->setting('logs.messages', true) || ($exception !== null && !$this->setting('exceptions.messages', true))) {
+                // Group by where the log call is, not by what it said.
+                $at = $exception !== null
+                    ? [$this->location->relative((string) $exception->getFile()), (int) $exception->getLine()]
+                    : $this->location->find();
+                $fingerprint = Fingerprint::log($level, 'at ' . ($at !== null ? $at[0] . ':' . $at[1] : '?'));
+                [$text, $redacted, $cut] = [self::MESSAGE_NOT_CAPTURED, false, null];
+            }
             $record = [
                 't' => 'log',
                 'v' => self::RECORD_VERSION,
@@ -569,7 +594,7 @@ class Recorder
                 'severity' => Levels::severity($level),
                 'message' => $text,
                 'context' => [],
-                'fingerprint' => Fingerprint::log($level, $text),
+                'fingerprint' => $fingerprint,
             ];
             self::mark($record, 'message', $redacted, $cut);
             if ($this->setting('logs.context', true)) {
@@ -604,7 +629,7 @@ class Recorder
     public function recordException(\Throwable $exception): void
     {
         try {
-            if (!$this->setting('exceptions.enabled', true)) {
+            if (!$this->setting('exceptions.enabled', true) || $this->stopIfSwitchedOff()) {
                 return;
             }
             $execution = $this->current();
@@ -858,21 +883,29 @@ class Recorder
      */
     private function statement(Execution $execution, string $key): array
     {
-        if (!isset($this->normalized[$key])) {
+        $statement = $execution->statements[$key] ?? null;
+        $driver = $statement !== null ? (string) $statement[5] : '';
+        // The cache holds normalisation only, per driver; whether SQL text
+        // may be shown is decided below for this execution, every time.
+        $cacheKey = $driver . "\0" . $key;
+        if (!isset($this->normalized[$cacheKey])) {
             if (count($this->normalized) >= 2000 || $this->normalizedBytes > self::NORMALIZED_CACHE_BYTES) {
                 $this->normalized = [];
                 $this->normalizedBytes = 0;
             }
-            $statement = $execution->statements[$key] ?? null;
             $connection = $statement !== null ? $statement[0] : '';
             $raw = $statement !== null ? $statement[1] : '';
-            $normalized = $raw === null ? SqlNormalizer::TOO_LONG : SqlNormalizer::normalize($raw, $statement !== null ? (string) $statement[5] : '');
-            $sql = $execution->setting('queries.capture_sql', true) ? $this->redactor->redactPatterns($normalized) : self::SQL_NOT_CAPTURED;
-            $this->normalized[$key] = [SqlNormalizer::hash($connection, $normalized), $sql, $connection];
-            $this->normalizedBytes += strlen($sql) + strlen($key);
+            $normalized = $raw === null ? SqlNormalizer::TOO_LONG : SqlNormalizer::normalize($raw, $driver);
+            $sql = $this->redactor->redactPatterns($normalized);
+            $this->normalized[$cacheKey] = [SqlNormalizer::hash($connection, $normalized), $sql, $connection];
+            $this->normalizedBytes += strlen($sql) + strlen($cacheKey);
+        }
+        $entry = $this->normalized[$cacheKey];
+        if (!$execution->setting('queries.capture_sql', true)) {
+            $entry[1] = self::SQL_NOT_CAPTURED;
         }
 
-        return $this->normalized[$key];
+        return $entry;
     }
 
     /**
@@ -1189,6 +1222,20 @@ class Recorder
         return $this->off;
     }
 
+    /**
+     * At every capture point: when switched off, drop whatever is open so
+     * nothing more is collected and its memory is released at once.
+     */
+    private function stopIfSwitchedOff(): bool
+    {
+        if (!$this->isSwitchedOff()) {
+            return false;
+        }
+        $this->stack = [];
+
+        return true;
+    }
+
     public function sanitizer(): BodySanitizer
     {
         return $this->sanitizer;
@@ -1325,27 +1372,6 @@ class Recorder
         }
 
         return $out;
-    }
-
-    /**
-     * A body parsed, masked and then cut (see BodySanitizer). Notes from
-     * BodyReader ("[streamed body not kept, 2.1 MB]") pass as is.
-     *
-     * @param array<int, string> $onlyFields
-     */
-    private function outgoingBody(string $body, ?string $contentType, int $maxBytes, ?int $fullSize, array $onlyFields, ?array &$meta = null): string
-    {
-        $meta = ['redacted' => false, 'cut' => null];
-        if (preg_match('/^\[[^\]]* not kept(, [^\]]*)?\]$/', $body) === 1) {
-            $meta['cut'] = trim($body, '[]');
-
-            return $body;
-        }
-
-        $clean = $this->sanitizer->sanitize($body, $contentType, $maxBytes, $fullSize, $onlyFields);
-        $meta = ['redacted' => $clean['redacted'], 'cut' => $clean['cut']];
-
-        return $clean['text'];
     }
 
     /**

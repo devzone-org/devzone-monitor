@@ -121,8 +121,9 @@ LOG_MONITOR_SPOOL_GROUP=www-data
 ### Commands
 
 `log-monitor:off` takes effect for new web requests at once. A running
-queue worker notices within about 5 seconds; the job it is running at that
-moment writes nothing, and it starts no capture for the next job. No
+queue worker notices within about 5 seconds: it stops collecting at once
+(the job in hand is dropped from memory and writes nothing) and starts no
+capture for the next job. No
 `queue:restart` is needed for `off` and `on`, but it is needed after
 changing `LOG_MONITOR_ENABLED` or any other setting, because workers read
 the config once when they start.
@@ -263,7 +264,7 @@ these limits:
 | `queries.max_statements` | 1000 | Distinct SQL statements tracked per execution |
 | `queries.max_statement_bytes` | 2 MB | Their text. Statements over 128 KB are tracked by hash only |
 | `queries.max_per_request` | 2000 | Queries listed individually (sampled/all mode) |
-| `redact.max_body_parse_bytes` | 64 KB | Body read and parsed per request/call |
+| `redact.max_body_parse_bytes` | 64 KB | Body read and parsed per request/call; also checked on input Laravel already parsed, before any masking |
 | `redact.max_body_values` | 5000 | Values walked in one body; more and the body is not kept |
 | Log context | 1000 values, depth 6 | Context passed with a log call |
 
@@ -304,7 +305,7 @@ Content-Encoding: gzip
   "env": "production",
   "host": "web-01",
   "client": "acme",
-  "package": "2.1.0",
+  "package": "2.1.2",
   "v": 2,
   "sent_at": "2026-09-19T10:16:00Z",
   "count": 7,
@@ -357,16 +358,28 @@ The server must:
   is not kept. XML is parsed without network access, and XML with a DOCTYPE
   is refused.
 - **URLs**: incoming requests are stored as the route template; other paths
-  have token-like segments (16+ mixed letters and digits, hex strings, JWTs)
-  replaced with `{token}`; credentials in URLs and secret query parameters
-  are masked, also inside headers such as `Referer` and `Location` and in
-  free text.
+  have token-like segments (16+ mixed letters and digits, hex strings, JWTs,
+  `id:secret` pairs such as Telegram bot tokens) replaced with `{token}`;
+  credentials in URLs and secret query parameters are masked, also inside
+  headers such as `Referer` and `Location` and in free text. Webhook hosts
+  that carry the credential in the path (Slack, Zapier, Office 365) keep no
+  path at all, and `redact.hosts` adds rules for your own integrations.
+- **Notes are never taken from content.** "Not kept" notes are produced by
+  the package itself; a body that merely looks like one is sanitized like
+  any other.
+- **Allowlists apply to every body shape**: with `only_fields` set, a body
+  that is a bare string, number or boolean is not kept.
 - **SQL**: binding values are never recorded. Literals of every dialect
-  (MySQL double quotes, PostgreSQL `$$` and `$tag$` strings, `E''`, `N''`,
-  `X''`) and comments are removed from the whole statement before it is cut;
-  SQL that cannot be parsed safely is replaced by a note.
+  (MySQL double quotes, SQLite double quotes, PostgreSQL `$$` and `$tag$`
+  strings, `E''`, `N''`, `X''`) and comments (including nested PostgreSQL
+  comments) are removed from the whole statement before it is cut; SQL that
+  cannot be parsed safely is replaced by a note.
   `queries.capture_sql => false` records timings and hashes without any SQL
-  text.
+  text, and is applied to every record of every request or job separately,
+  so a job override can never be undone by what ran before it.
+- **Messages**: `exceptions.messages => false` hides exception messages
+  everywhere, including the log line Laravel writes for the exception;
+  `logs.messages => false` hides all log message text.
 - **The spool** is readable only by the PHP user by default (see
   [Scheduler](#scheduler)).
 - **Transport:** https only (plain http only with `LOG_MONITOR_ALLOW_HTTP`
@@ -378,6 +391,10 @@ The server must:
 
 ### Known limitations
 
+Masking reduces what can reach the monitoring server; it cannot guarantee
+that nothing sensitive does. Check a pilot's records for your own data
+before widening capture.
+
 - Free text (log messages, exception messages, unparsed strings) is masked
   by rules. A secret with no recognisable key or pattern (for example
   `"Customer 4 said hunter2"`) cannot be found. Keep secrets out of log
@@ -386,9 +403,15 @@ The server must:
   `password: two words` only `two` is masked. Quoted values
   (`"password": "two words"`) are masked whole.
 - Path segments are masked by shape and context: 16+ character tokens
-  anywhere, and shorter ones after words such as `signed`, `reset`,
-  `verify`, `invite` or `token`. A short token elsewhere in a path that is
-  not a route is kept; add a `redact.path_patterns` rule for such URLs.
+  anywhere, `id:secret` pairs, and shorter ones after words such as
+  `signed`, `reset`, `verify`, `invite` or `token`. A short token elsewhere
+  in an outgoing path, or in an incoming path that matched no route, is
+  kept. Add a `redact.hosts` rule (`'path' => 'omit'` or `path_patterns`)
+  for every integration that puts a credential in its URL.
+- In SQLite, `"name"` is masked as a possible string, so quoted identifiers
+  show as `?`.
+- A log message is fingerprinted by the call's location when messages are
+  hidden, so different messages from one line group together.
 - Masking by key can hide harmless values (`card_type`, `token_count`).
 - Summary query mode still records the SQL text of slow and repeated
   queries; use `capture_sql => false` to avoid SQL text entirely.

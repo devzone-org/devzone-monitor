@@ -28,10 +28,12 @@ final class BodyReader
     ];
 
     /**
-     * @return array{body: string, size: ?int, type: string}|null body = text
-     *         read (at most $limit bytes) or a bracketed note; size = full
-     *         body size when known; type = Content-Type. Null when there is
-     *         no body.
+     * @return array{body: ?string, note: ?string, size: ?int, type: string}|null
+     *         body = text read (at most $limit bytes), or null when the body
+     *         was not read, and then note says why; size = full body size
+     *         when known; type = Content-Type. Null when there is no body.
+     *         The note is built here only, never taken from the body, so
+     *         the other side cannot forge one.
      */
     public static function read($message, int $limit): ?array
     {
@@ -50,11 +52,13 @@ final class BodyReader
             $contentType = $psr->getHeaderLine('Content-Type');
             $type = strtolower(trim(explode(';', $contentType)[0]));
             if ($type !== '' && self::isBinaryType($type)) {
-                return ['body' => self::note("{$type} body not kept", $size), 'size' => $size, 'type' => $contentType];
+                $label = preg_match('#^[a-z0-9.+\-]{1,40}/[a-z0-9.+\-]{1,60}$#', $type) === 1 ? $type : 'binary';
+
+                return ['body' => null, 'note' => self::note("{$label} body not kept", $size), 'size' => $size, 'type' => $contentType];
             }
 
             if (!$stream->isSeekable() || !$stream->isReadable()) {
-                return ['body' => self::note('streamed body not kept', $size), 'size' => $size, 'type' => $contentType];
+                return ['body' => null, 'note' => self::note('streamed body not kept', $size), 'size' => $size, 'type' => $contentType];
             }
 
             $position = $stream->tell();
@@ -82,10 +86,10 @@ final class BodyReader
                 return null;
             }
             if (strpos($data, "\0") !== false) {
-                return ['body' => self::note('binary body not kept', $size), 'size' => $size, 'type' => $contentType];
+                return ['body' => null, 'note' => self::note('binary body not kept', $size), 'size' => $size, 'type' => $contentType];
             }
 
-            return ['body' => $data, 'size' => $size, 'type' => $contentType];
+            return ['body' => $data, 'note' => null, 'size' => $size, 'type' => $contentType];
         } catch (\Throwable $e) {
             return null;
         }
