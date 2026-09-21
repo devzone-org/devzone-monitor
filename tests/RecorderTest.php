@@ -624,6 +624,46 @@ final class RecorderTest extends TestCase
         $this->assertNull($request['status']);
     }
 
+    public function testARequestStoppedByPhpStillSaysWhichRequestItWas(): void
+    {
+        $recorder = $this->recorder();
+        $execution = $recorder->startRequest();
+        // What the middleware sets when the request starts.
+        $execution->describe = function (): array {
+            return [
+                'method' => 'GET',
+                'url' => 'https://back-office.test/rates/auto',
+                'route' => '/rates/auto',
+                'action' => 'App\\Http\\Livewire\\Rate\\AutoRates',
+                'ip' => '203.0.113.9',
+                'user' => 12,
+                'status' => 200, // never trusted: the request did not answer
+            ];
+        };
+        $recorder->shutdown();
+
+        $request = $this->sink->records('request')[0];
+        $this->assertTrue($request['interrupted']);
+        $this->assertNull($request['status']);
+        $this->assertSame('GET', $request['method']);
+        $this->assertSame('/rates/auto', $request['route']);
+        $this->assertSame('https://back-office.test/rates/auto', $request['url']);
+        $this->assertSame('App\\Http\\Livewire\\Rate\\AutoRates', $request['action']);
+        $this->assertSame(12, $request['user']);
+    }
+
+    public function testAFailingDescriptionDoesNotLoseTheRequest(): void
+    {
+        $recorder = $this->recorder();
+        $execution = $recorder->startRequest();
+        $execution->describe = function (): array {
+            throw new \RuntimeException('container already gone');
+        };
+        $recorder->shutdown();
+
+        $this->assertTrue($this->sink->records('request')[0]['interrupted']);
+    }
+
     public function testTheKillSwitchIsCheckedWhileRunning(): void
     {
         $off = false;

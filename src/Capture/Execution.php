@@ -30,6 +30,15 @@ final class Execution
     /** @var array<string, mixed> Kind-specific details (job class, queue...). */
     public $meta = [];
 
+    /**
+     * For requests: returns the request's details (method, url, route, ...)
+     * when it cannot end normally, e.g. PHP stopping it at
+     * max_execution_time. Set by the request middleware.
+     *
+     * @var callable|null
+     */
+    public $describe = null;
+
     // Totals, never reset by partial flushes.
     public $queryCount = 0;
     public $queryMs = 0.0;

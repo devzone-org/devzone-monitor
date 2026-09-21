@@ -43,7 +43,15 @@ class CaptureRequests
     {
         try {
             if (!$this->ignored($request)) {
-                $this->recorder->startRequest();
+                $execution = $this->recorder->startRequest();
+                if ($execution !== null) {
+                    // If PHP stops the request (time limit, fatal error),
+                    // terminate() never runs; the shutdown handler uses this
+                    // to still say which request it was.
+                    $execution->describe = function () use ($request, $execution): array {
+                        return $this->info($request, null, $execution);
+                    };
+                }
             }
         } catch (\Throwable $e) {
             Report::error('request capture failed to start', $e);

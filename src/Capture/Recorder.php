@@ -354,7 +354,15 @@ class Recorder
                     $execution->exceptionCount++;
                 }
                 if ($execution->kind === 'request') {
-                    $this->finishRequest($execution, ['status' => null, 'interrupted' => true]);
+                    $info = [];
+                    if (is_callable($execution->describe)) {
+                        try {
+                            $info = (array) call_user_func($execution->describe);
+                        } catch (\Throwable $e) {
+                            $info = [];
+                        }
+                    }
+                    $this->finishRequest($execution, ['status' => null, 'interrupted' => true] + $info);
                 } else {
                     $this->finishJob($execution, 'interrupted');
                 }
