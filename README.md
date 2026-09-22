@@ -74,20 +74,31 @@ LOG_MONITOR_OUTGOING_BODIES=errors   # never (default) | errors | always
 LOG_MONITOR_OUTGOING_HEADERS=true    # headers of every call; Authorization, Cookie, X-Api-Key etc. masked
 ```
 
-To see the code that threw, and not only the file and line, turn on
-snippets:
+### Code around the line that threw
+
+An exception carries a few lines of your source around the line that threw,
+so the monitor shows the statement itself and not only a file and a line
+number. This is the one thing the package sends that is code rather than
+data, so it stays narrow: only your own PHP files are read (never `vendor/`,
+never anything outside the project, never a file over 2 MB), three lines
+either side (`exceptions.snippet_context`, up to 10), each cut to 200
+characters. When the throw itself is inside vendor code, the nearest line of
+your own code is shown instead.
+
+Every line is masked exactly as a log message is - tokens in URLs,
+connection strings, and the other patterns the redactor knows - and a
+literal behind a secret-looking name (`$apiKey = '...'`, `'password' =>
+'...'`) is replaced too, so a credential written into the code does not
+travel with the snippet. Turning `exceptions.messages` off turns snippets
+off with it: source lines quote the messages they throw.
+
+The file is read only when something throws - a healthy request never opens
+it - and costs about 0.1 ms for a normal class file. To keep code on the
+server:
 
 ```env
-LOG_MONITOR_SNIPPETS=true   # a few lines of your source around the throwing line
+LOG_MONITOR_SNIPPETS=false
 ```
-
-This is the only setting that sends code rather than data. Only your own
-PHP files are read (never `vendor/`, never anything outside the project,
-never a file over 2 MB), three lines either side by default
-(`exceptions.snippet_context`, up to 10), each cut to 200 characters, and a
-literal behind a secret-looking name (`$apiKey = '...'`) is masked. When the
-throw itself is inside vendor code, the nearest line of your own code is
-shown instead.
 
 Narrow them further in `config/log-monitor.php`: `outgoing.body_hosts`
 keeps bodies only for the hosts you list, and `only_fields` (for requests
@@ -320,7 +331,7 @@ Content-Encoding: gzip
   "env": "production",
   "host": "web-01",
   "client": "acme",
-  "package": "2.1.3",
+  "package": "2.1.4",
   "v": 2,
   "sent_at": "2026-09-19T10:16:00Z",
   "count": 7,

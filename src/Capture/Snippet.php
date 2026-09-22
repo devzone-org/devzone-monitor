@@ -8,11 +8,12 @@ use DevZone\LogMonitor\Support\Redactor;
  * A few lines of source around the line that threw, so the monitor can show
  * the statement itself rather than only a file and a line number.
  *
- * Off unless exceptions.snippets is turned on: this is the one place where
- * the package sends code rather than data, so it is the application's choice.
- * Even then it only ever reads the application's own PHP files (never vendor
- * code, never anything outside the project), at most a few short lines, and
- * values that look like credentials are masked the way log context is.
+ * Read only when something throws, so a healthy request never pays for it.
+ * This is the one place where the package sends code rather than data, so it
+ * stays narrow: only the application's own PHP files (never vendor code,
+ * never anything outside the project), at most a few short lines, and values
+ * that look like credentials are masked the way log context is. Turn it off
+ * with exceptions.snippets when code may not leave the server.
  */
 final class Snippet
 {
@@ -135,15 +136,16 @@ final class Snippet
     }
 
     /**
-     * One line of source: tabs kept as spaces, cut to a sane width, and any
-     * literal that sits behind a secret-looking name replaced, so a key
-     * written into the code is not shipped with the snippet.
+     * One line of source, masked exactly as a log message is: tokens in URLs,
+     * connection strings and the other patterns the redactor knows, plus any
+     * literal sitting behind a secret-looking name. A credential written into
+     * the code never ships with the snippet.
      */
     private function clean(string $text): string
     {
         $text = str_replace("\t", '    ', rtrim($text, "\r\n"));
         $text = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', '', $text);
-        $text = (string) $text;
+        $text = $this->redactor->redactString((string) $text);
 
         // name = "value", 'name' => "value", "name": "value"
         $text = preg_replace_callback(

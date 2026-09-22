@@ -812,7 +812,10 @@ class Recorder
      */
     private function snippet(string $file, int $line): ?array
     {
-        if (!$this->setting('exceptions.snippets', false)) {
+        // An application that will not send exception messages (because they
+        // quote customer data) must not get that same text back inside a
+        // line of its source.
+        if (!$this->setting('exceptions.snippets', true) || !$this->setting('exceptions.messages', true)) {
             return null;
         }
         if ($this->snippetReader === null) {

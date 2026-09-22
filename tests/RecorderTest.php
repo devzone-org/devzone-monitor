@@ -543,13 +543,9 @@ final class RecorderTest extends TestCase
         $this->assertSame(['class' => 'RuntimeException', 'message' => 'Login failed for [REDACTED]', 'file' => 'tests/RecorderTest.php', 'line' => $exceptions[0]['line']], $this->sink->records('log')[0]['context']['exception']);
     }
 
-    public function testSnippetsAreOffUntilTurnedOn(): void
+    public function testAnExceptionCarriesTheCodeAroundTheLineThatThrew(): void
     {
-        $recorder = $this->recorder();
-        $recorder->recordException(new \RuntimeException('x'));
-        $this->assertArrayNotHasKey('snippet', $this->sink->records('exception')[0]);
-
-        $recorder = $this->recorder(['exceptions.snippets' => true, 'exceptions.snippet_context' => 2]);
+        $recorder = $this->recorder(['exceptions.snippet_context' => 2]);
         $line = __LINE__ + 1;
         $recorder->recordException(new \RuntimeException('x'));
 
@@ -561,6 +557,26 @@ final class RecorderTest extends TestCase
             'recordException(new \RuntimeException',
             $snippet['lines'][$snippet['line'] - $snippet['start']]
         );
+    }
+
+    public function testSnippetsCanBeTurnedOffSoNoCodeLeavesTheServer(): void
+    {
+        $recorder = $this->recorder(['exceptions.snippets' => false]);
+        $recorder->recordException(new \RuntimeException('x'));
+
+        $this->assertArrayNotHasKey('snippet', $this->sink->records('exception')[0]);
+    }
+
+    /**
+     * Source lines quote the messages they throw, so hiding messages hides
+     * the code as well.
+     */
+    public function testHidingExceptionMessagesAlsoHidesTheCode(): void
+    {
+        $recorder = $this->recorder(['exceptions.messages' => false]);
+        $recorder->recordException(new \RuntimeException('Customer 3520212345671 rejected'));
+
+        $this->assertArrayNotHasKey('snippet', $this->sink->records('exception')[0]);
     }
 
     public function testSyncJobInsideRequestIsLinkedAndSeparated(): void
