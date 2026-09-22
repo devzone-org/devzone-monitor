@@ -74,6 +74,16 @@ class Location
         return is_string($file) ? dirname($file, 2) . DIRECTORY_SEPARATOR : null;
     }
 
+    public function basePath(): string
+    {
+        return $this->basePath;
+    }
+
+    public function vendorPath(): string
+    {
+        return $this->vendorPath;
+    }
+
     public function relative(string $file): string
     {
         return strpos($file, $this->basePath) === 0 ? substr($file, strlen($this->basePath)) : $file;

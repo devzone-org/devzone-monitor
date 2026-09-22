@@ -543,6 +543,26 @@ final class RecorderTest extends TestCase
         $this->assertSame(['class' => 'RuntimeException', 'message' => 'Login failed for [REDACTED]', 'file' => 'tests/RecorderTest.php', 'line' => $exceptions[0]['line']], $this->sink->records('log')[0]['context']['exception']);
     }
 
+    public function testSnippetsAreOffUntilTurnedOn(): void
+    {
+        $recorder = $this->recorder();
+        $recorder->recordException(new \RuntimeException('x'));
+        $this->assertArrayNotHasKey('snippet', $this->sink->records('exception')[0]);
+
+        $recorder = $this->recorder(['exceptions.snippets' => true, 'exceptions.snippet_context' => 2]);
+        $line = __LINE__ + 1;
+        $recorder->recordException(new \RuntimeException('x'));
+
+        $snippet = $this->sink->records('exception')[0]['snippet'];
+        $this->assertSame($line - 2, $snippet['start']);
+        $this->assertSame($line, $snippet['line']);
+        $this->assertCount(5, $snippet['lines']);
+        $this->assertStringContainsString(
+            'recordException(new \RuntimeException',
+            $snippet['lines'][$snippet['line'] - $snippet['start']]
+        );
+    }
+
     public function testSyncJobInsideRequestIsLinkedAndSeparated(): void
     {
         $recorder = $this->recorder();
@@ -598,6 +618,31 @@ final class RecorderTest extends TestCase
         $this->assertSame('failed', $jobRecord['status']);
         $this->assertSame('RuntimeException', $jobRecord['exception']['class']);
         $this->assertCount(1, $this->sink->records('exception'));
+        $this->assertSame($jobRecord['trace'], $this->sink->records('exception')[0]['trace']);
+    }
+
+    /**
+     * The queue worker reports the exception again once the job has ended.
+     * That copy knows nothing about the job, so keeping it would leave the
+     * job page without a stack trace and count the failure twice.
+     */
+    public function testTheWorkerReportingTheSameExceptionAfterTheJobIsNotRecordedTwice(): void
+    {
+        $recorder = $this->recorder();
+        $exception = new \RuntimeException('Onfido timeout');
+
+        $job = $recorder->startJob(['class' => 'App\\Jobs\\RunSanctions', 'job_id' => '9'], null);
+        $recorder->finishJob($job, 'failed', $exception);
+        $recorder->recordLog('error', 'Onfido timeout', ['exception' => $exception]);
+
+        $exceptions = $this->sink->records('exception');
+        $this->assertCount(1, $exceptions);
+        $this->assertSame($this->sink->records('job')[0]['trace'], $exceptions[0]['trace']);
+        $this->assertSame([], $this->sink->records('log'));
+
+        // A different exception outside any execution is still recorded.
+        $recorder->recordLog('error', 'other', ['exception' => new \LogicException('other')]);
+        $this->assertCount(2, $this->sink->records('exception'));
     }
 
     public function testOversizedRecordIsShrunkNotDropped(): void

@@ -74,6 +74,21 @@ LOG_MONITOR_OUTGOING_BODIES=errors   # never (default) | errors | always
 LOG_MONITOR_OUTGOING_HEADERS=true    # headers of every call; Authorization, Cookie, X-Api-Key etc. masked
 ```
 
+To see the code that threw, and not only the file and line, turn on
+snippets:
+
+```env
+LOG_MONITOR_SNIPPETS=true   # a few lines of your source around the throwing line
+```
+
+This is the only setting that sends code rather than data. Only your own
+PHP files are read (never `vendor/`, never anything outside the project,
+never a file over 2 MB), three lines either side by default
+(`exceptions.snippet_context`, up to 10), each cut to 200 characters, and a
+literal behind a secret-looking name (`$apiKey = '...'`) is masked. When the
+throw itself is inside vendor code, the nearest line of your own code is
+shown instead.
+
 Narrow them further in `config/log-monitor.php`: `outgoing.body_hosts`
 keeps bodies only for the hosts you list, and `only_fields` (for requests
 and outgoing calls) keeps only the values under the keys you list.
@@ -305,7 +320,7 @@ Content-Encoding: gzip
   "env": "production",
   "host": "web-01",
   "client": "acme",
-  "package": "2.1.2",
+  "package": "2.1.3",
   "v": 2,
   "sent_at": "2026-09-19T10:16:00Z",
   "count": 7,

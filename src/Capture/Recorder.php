@@ -43,6 +43,9 @@ class Recorder
     /** @var Location */
     private $location;
 
+    /** @var Snippet|null Built on first use; null when snippets are off. */
+    private $snippetReader;
+
     /** @var callable(): float */
     private $clock;
 
@@ -75,6 +78,16 @@ class Recorder
 
     /** @var int Values left for the log context being normalised. */
     private $contextBudget = 0;
+
+    /**
+     * The exception a job just finished with. The queue worker reports it
+     * after the job has ended, when nothing is running any more; that copy
+     * is dropped, since the job already carries it with its trace. Held by
+     * reference (not spl_object_id) so it cannot match another exception.
+     *
+     * @var \Throwable|null
+     */
+    private $jobException = null;
 
     public function __construct(
         array $config,
@@ -200,6 +213,7 @@ class Recorder
      */
     public function startJob(array $meta, ?string $parent): ?Execution
     {
+        $this->jobException = null;
         try {
             if (!$this->setting('jobs.enabled', true) || $this->isSwitchedOff()) {
                 return null;
@@ -244,6 +258,7 @@ class Recorder
         try {
             if ($exception !== null) {
                 $this->recordExceptionOn($execution, $exception);
+                $this->jobException = $exception;
             }
             $execution->finished = true;
             $this->remove($execution);
@@ -559,6 +574,9 @@ class Recorder
             // Exceptions reported through the log are captured as exception
             // records whatever the log level.
             $exception = isset($context['exception']) && $context['exception'] instanceof \Throwable ? $context['exception'] : null;
+            if ($execution === null && $this->isJobException($exception)) {
+                return;
+            }
             if ($exception !== null && $this->setting('exceptions.enabled', true)) {
                 if ($execution !== null) {
                     $this->recordExceptionOn($execution, $exception);
@@ -633,6 +651,9 @@ class Recorder
                 return;
             }
             $execution = $this->current();
+            if ($execution === null && $this->isJobException($exception)) {
+                return;
+            }
             if ($execution === null) {
                 $this->write([$this->encode($this->exceptionRecord(null, $exception))]);
 
@@ -642,6 +663,20 @@ class Recorder
         } catch (\Throwable $e) {
             Report::error('could not record exception', $e);
         }
+    }
+
+    /**
+     * Whether this is the exception the last job finished with, reported
+     * again by the worker after the job ended.
+     */
+    private function isJobException(?\Throwable $exception): bool
+    {
+        if ($exception === null || $this->jobException === null || $exception !== $this->jobException) {
+            return false;
+        }
+        $this->jobException = null;
+
+        return true;
     }
 
     // ------------------------------------------------------------------
@@ -678,12 +713,18 @@ class Recorder
         $maxFrames = (int) $this->setting('exceptions.max_frames', 50);
 
         $frames = [];
+        $appFrame = null;
         foreach ($exception->getTrace() as $frame) {
-            if (count($frames) >= $maxFrames) {
-                break;
-            }
             if (isset($frame['file'], $frame['line'])) {
-                $frames[] = $this->location->relative((string) $frame['file']) . ':' . (int) $frame['line'];
+                if ($appFrame === null && $this->location->fromFrame((string) $frame['file'], (int) $frame['line']) !== null) {
+                    $appFrame = [(string) $frame['file'], (int) $frame['line']];
+                }
+                if (count($frames) < $maxFrames) {
+                    $frames[] = $this->location->relative((string) $frame['file']) . ':' . (int) $frame['line'];
+                }
+            }
+            if (count($frames) >= $maxFrames && $appFrame !== null) {
+                break;
             }
         }
 
@@ -716,6 +757,20 @@ class Recorder
         ];
         self::mark($record, 'message', $redacted, $cut);
 
+        // The code around the line that threw. When the throw itself is in
+        // vendor code (a framework check, a driver), the nearest line of the
+        // application's own code is shown instead.
+        $snippet = $this->snippet((string) $exception->getFile(), (int) $exception->getLine());
+        if ($snippet === null && $appFrame !== null) {
+            $snippet = $this->snippet($appFrame[0], $appFrame[1]);
+            if ($snippet !== null) {
+                $snippet['file'] = $this->location->relative($appFrame[0]);
+            }
+        }
+        if ($snippet !== null) {
+            $record['snippet'] = $snippet;
+        }
+
         return $record;
     }
 
@@ -727,7 +782,7 @@ class Recorder
     {
         $file = $this->location->relative((string) $error['file']);
 
-        return [
+        $record = [
             't' => 'exception',
             'v' => self::RECORD_VERSION,
             'trace' => $execution->trace,
@@ -743,6 +798,28 @@ class Recorder
             'previous' => [],
             'fingerprint' => Fingerprint::exception('FatalError', $file, (int) $error['line']),
         ];
+
+        $snippet = $this->snippet((string) $error['file'], (int) $error['line']);
+        if ($snippet !== null) {
+            $record['snippet'] = $snippet;
+        }
+
+        return $record;
+    }
+
+    /**
+     * @return array{start: int, line: int, lines: array<int, string>}|null
+     */
+    private function snippet(string $file, int $line): ?array
+    {
+        if (!$this->setting('exceptions.snippets', false)) {
+            return null;
+        }
+        if ($this->snippetReader === null) {
+            $this->snippetReader = new Snippet($this->location, $this->redactor);
+        }
+
+        return $this->snippetReader->read($file, $line, (int) $this->setting('exceptions.snippet_context', 3));
     }
 
     /**

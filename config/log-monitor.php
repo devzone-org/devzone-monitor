@@ -169,6 +169,15 @@ return [
     'exceptions' => [
         'enabled' => true,
         'max_frames' => 50,
+        // A few lines of your source around the line that threw, so the
+        // monitor can show the statement itself. Off by default: this is
+        // the only setting that sends code rather than data. Only the
+        // application's own PHP files are read (never vendor), lines are
+        // cut to 200 characters and literals behind secret-looking names
+        // are masked.
+        'snippets' => env('LOG_MONITOR_SNIPPETS', false),
+        // Lines either side of the one that threw (1-10).
+        'snippet_context' => 3,
         // Exception messages (masked). false keeps class, file, line and
         // frames only: for apps whose exceptions quote user input. Also
         // hides the log line Laravel writes with the same message.
